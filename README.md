@@ -19,18 +19,22 @@ Real-time vocal pitch correction for Linux. Tune hard and still sound human: it 
 
 ### Option 1: download the ready-made plugin (easiest)
 
-1. Go to the **[Releases page](https://github.com/adinwalls/tunebrew/releases/latest)** and download `TuneBrew-<version>-linux-x86_64.tar.gz`.
+1. Download **[TuneBrew-1.4.3-linux-x86_64.tar.gz](https://github.com/adinwalls/tunebrew/raw/main/dist/TuneBrew-1.4.3-linux-x86_64.tar.gz)** (about 1 MB). It'll go to your Downloads folder.
+   Or download it from a terminal:
+   ```bash
+   wget -P ~/Downloads https://github.com/adinwalls/tunebrew/raw/main/dist/TuneBrew-1.4.3-linux-x86_64.tar.gz
+   ```
 2. Open a terminal and go to your Downloads folder:
    ```bash
    cd ~/Downloads
    ```
 3. Unpack it:
    ```bash
-   tar xzf TuneBrew-*-linux-x86_64.tar.gz
+   tar xzf TuneBrew-1.4.3-linux-x86_64.tar.gz
    ```
 4. Go into the folder and run the installer:
    ```bash
-   cd TuneBrew-*-linux-x86_64
+   cd TuneBrew-1.4.3-linux-x86_64
    ./install.sh
    ```
    It copies the plugin into your home folder (`~/.lv2`, `~/.vst3`, `~/.clap`, `~/.vst`), so no `sudo` is needed.
