@@ -1,0 +1,17 @@
+# build output
+/bin/
+/build/
+dpf/utils/lv2_ttl_generator
+*.o
+*.d
+# test scratch
+test/*.f32
+test/*.wav
+test/*.png
+test/harness
+test/harness2
+test/harness_old
+test/lv2host
+test/claphost
+test/render_ui
+__pycache__/
