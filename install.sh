@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Installs TuneBrew Autotune for the current user (no sudo needed).
+# Installs the Adin Brew plugins (TuneBrew Autotune, LevelBrew Vocal Rider) for the
+# current user (no sudo needed).
 # Usage: ./install.sh            install (builds first if there are no prebuilt binaries)
 #        ./install.sh --rebuild  force a fresh build from source
 set -e
 cd "$(dirname "$0")"
 
-if [ ! -d bin/TuneBrew.lv2 ] || [ "$1" = "--rebuild" ]; then
-    echo "==> Building TuneBrew from source..."
+if { [ ! -d bin/TuneBrew.lv2 ] && [ ! -d bin/LevelBrew.lv2 ]; } || [ "$1" = "--rebuild" ]; then
+    echo "==> Building from source..."
     if [ ! -f dpf/Makefile.plugins.mk ]; then
         if [ -d .git ]; then
             echo "==> Fetching the DPF framework (git submodule)..."
             git submodule update --init --recursive
         else
             echo "ERROR: the dpf/ folder is missing. Clone with:"
-            echo "  git clone --recursive https://github.com/adinwalls/tunebrew.git"
+            echo "  git clone --recursive https://github.com/adinwalls/adin-brew.git"
             exit 1
         fi
     fi
@@ -26,15 +27,17 @@ if [ ! -d bin/TuneBrew.lv2 ] || [ "$1" = "--rebuild" ]; then
 fi
 
 mkdir -p ~/.lv2 ~/.vst3 ~/.clap ~/.vst
-rm -rf ~/.lv2/TuneBrew.lv2 ~/.vst3/TuneBrew.vst3
-cp -r bin/TuneBrew.lv2  ~/.lv2/
-cp -r bin/TuneBrew.vst3 ~/.vst3/
-cp    bin/TuneBrew.clap ~/.clap/
-cp    bin/TuneBrew-vst.so ~/.vst/
+installed=""
+for p in TuneBrew LevelBrew; do
+    [ -d "bin/$p.lv2" ] || continue
+    rm -rf ~/.lv2/"$p".lv2 ~/.vst3/"$p".vst3
+    cp -r "bin/$p.lv2" ~/.lv2/
+    [ -d "bin/$p.vst3" ]    && cp -r "bin/$p.vst3" ~/.vst3/
+    [ -f "bin/$p.clap" ]    && cp "bin/$p.clap" ~/.clap/
+    [ -f "bin/$p-vst.so" ]  && cp "bin/$p-vst.so" ~/.vst/
+    installed="$installed $p"
+done
 echo ""
-echo "TuneBrew Autotune installed:"
-echo "  LV2  -> ~/.lv2/TuneBrew.lv2"
-echo "  VST3 -> ~/.vst3/TuneBrew.vst3"
-echo "  CLAP -> ~/.clap/TuneBrew.clap"
-echo "  VST2 -> ~/.vst/TuneBrew-vst.so"
-echo "Rescan plugins in your DAW and look for 'TuneBrew Autotune'."
+echo "Installed:$installed"
+echo "  LV2 -> ~/.lv2   VST3 -> ~/.vst3   CLAP -> ~/.clap   VST2 -> ~/.vst"
+echo "Rescan plugins in your DAW and look for 'TuneBrew Autotune' and 'LevelBrew Vocal Rider'."

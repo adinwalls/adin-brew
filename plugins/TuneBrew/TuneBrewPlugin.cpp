@@ -27,7 +27,7 @@ protected:
     }
     const char* getMaker() const override { return "Adin Walls"; }
     const char* getLicense() const override { return "GPL-3.0-or-later"; }
-    const char* getHomePage() const override { return "https://github.com/adinwalls/tunebrew"; }
+    const char* getHomePage() const override { return "https://github.com/adinwalls/adin-brew"; }
     uint32_t getVersion() const override { return d_version(1, 4, 3); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override

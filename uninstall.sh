@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
-rm -rf ~/.lv2/TuneBrew.lv2 ~/.vst3/TuneBrew.vst3 ~/.clap/TuneBrew.clap ~/.vst/TuneBrew-vst.so
-echo "TuneBrew Autotune removed."
+for p in TuneBrew LevelBrew; do
+    rm -rf ~/.lv2/"$p".lv2 ~/.vst3/"$p".vst3 ~/.clap/"$p".clap ~/.vst/"$p"-vst.so
+done
+echo "TuneBrew Autotune and LevelBrew Vocal Rider removed."

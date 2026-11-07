@@ -1,10 +1,13 @@
-# TuneBrew Autotune
+# Adin Brew
 
-*by Adin Walls*
+*Vocal plugins for Linux by Adin Walls*
 
-Real-time vocal pitch correction for Linux. Tune hard and still sound human: it keeps the singer's vibrato even at 0 ms retune, detects the song's key for you, and has a classic hard-tune mode for the robot effect.
+| Plugin | What it does |
+|---|---|
+| **[TuneBrew Autotune](#tunebrew-autotune)** | Real-time pitch correction that tunes hard and still sounds human. Keeps vibrato at 0 ms retune, detects the key, and has a classic hard-tune mode. |
+| **[LevelBrew Vocal Rider](#levelbrew-vocal-rider)** | Rides the level of a recorded vocal. It reads the whole take first, then you watch it ride the fader during playback. |
 
-**Formats:** LV2, VST3, CLAP and VST2 (64-bit Linux). Works in REAPER, Ardour, Harrison Mixbus, Bitwig Studio, Carla and other Linux DAWs.
+**Formats:** LV2, VST3 and VST2 (64-bit Linux). TuneBrew also comes as CLAP. They work in Harrison Mixbus, Ardour, REAPER, Bitwig Studio, Carla and other Linux DAWs.
 
 ![TuneBrew Autotune](docs/screenshot.png)
 
@@ -17,12 +20,12 @@ Real-time vocal pitch correction for Linux. Tune hard and still sound human: it 
 - 64-bit Linux with **glibc 2.35 or newer**: Ubuntu / Pop!_OS / Linux Mint 22.04+, Fedora 36+, Debian 12+, Arch, Manjaro.
 - A Linux DAW that loads LV2, VST3 or CLAP plugins.
 
-### Option 1: download the ready-made plugin (easiest)
+### Option 1: download the ready-made plugins (easiest)
 
-1. Download **[TuneBrew-1.4.3-linux-x86_64.tar.gz](https://github.com/adinwalls/tunebrew/raw/main/dist/TuneBrew-1.4.3-linux-x86_64.tar.gz)** (about 1 MB). It'll go to your Downloads folder.
+1. Download **[adin-brew-linux-x86_64.tar.gz](https://github.com/adinwalls/adin-brew/raw/main/dist/adin-brew-linux-x86_64.tar.gz)** (about 2 MB). It'll go to your Downloads folder.
    Or download it from a terminal:
    ```bash
-   wget -P ~/Downloads https://github.com/adinwalls/tunebrew/raw/main/dist/TuneBrew-1.4.3-linux-x86_64.tar.gz
+   wget -P ~/Downloads https://github.com/adinwalls/adin-brew/raw/main/dist/adin-brew-linux-x86_64.tar.gz
    ```
 2. Open a terminal and go to your Downloads folder:
    ```bash
@@ -30,18 +33,18 @@ Real-time vocal pitch correction for Linux. Tune hard and still sound human: it 
    ```
 3. Unpack it:
    ```bash
-   tar xzf TuneBrew-1.4.3-linux-x86_64.tar.gz
+   tar xzf adin-brew-linux-x86_64.tar.gz
    ```
 4. Go into the folder and run the installer:
    ```bash
-   cd TuneBrew-1.4.3-linux-x86_64
+   cd adin-brew-linux-x86_64
    ./install.sh
    ```
-   It copies the plugin into your home folder (`~/.lv2`, `~/.vst3`, `~/.clap`, `~/.vst`), so no `sudo` is needed.
-5. Open your DAW and **rescan plugins** (see [Finding it in your DAW](#finding-it-in-your-daw)).
-6. Add **TuneBrew Autotune** to your vocal track. Done!
+   It copies both plugins into your home folder (`~/.lv2`, `~/.vst3`, `~/.clap`, `~/.vst`), so no `sudo` is needed.
+5. Open your DAW and **rescan plugins** (see [Finding them in your DAW](#finding-them-in-your-daw)).
+6. Add **TuneBrew Autotune** or **LevelBrew Vocal Rider** to your vocal track. Done!
 
-### Option 2: build it from source
+### Option 2: build them from source
 
 1. Install the build tools.
 
@@ -57,38 +60,40 @@ Real-time vocal pitch correction for Linux. Tune hard and still sound human: it 
    ```bash
    sudo pacman -S --needed git base-devel cairo libx11 libxext
    ```
-2. Download the source, including the DPF framework it's built on:
+2. Download the source, including the DPF framework they're built on:
    ```bash
-   git clone --recursive https://github.com/adinwalls/tunebrew.git
-   cd tunebrew
+   git clone --recursive https://github.com/adinwalls/adin-brew.git
+   cd adin-brew
    ```
 3. Build and install:
    ```bash
    ./install.sh
    ```
-4. Rescan plugins in your DAW and add **TuneBrew Autotune** to your vocal track.
+4. Rescan plugins in your DAW.
 
 To update later: `git pull && git submodule update --init --recursive && ./install.sh --rebuild`
 
-### Finding it in your DAW
+### Finding them in your DAW
 
 Menu names vary a little between versions.
 
-- **REAPER:** *Options → Preferences → Plug-ins → VST* (or *CLAP*), then **Re-scan**. Use the CLAP or VST3 version.
-- **Ardour / Harrison Mixbus:** LV2 plugins are found on start-up. If it's missing, open *Window → Plugin Manager* and choose **Re-scan**.
-- **Bitwig Studio:** *Settings → Locations → Plug-ins*: make sure your user CLAP/VST3 folders are enabled, then rescan.
+- **Ardour / Harrison Mixbus:** LV2 plugins are found on start-up. If one is missing, open *Window → Plugin Manager* and choose **Re-scan**.
+- **REAPER:** *Options → Preferences → Plug-ins → VST* (or *CLAP*), then **Re-scan**. Use the VST3 version (or CLAP for TuneBrew).
+- **Bitwig Studio:** *Settings → Locations → Plug-ins*: make sure your user VST3/CLAP folders are enabled, then rescan.
 - **Carla:** *Add Plugin → Refresh*.
 
-The plugin shows up as **TuneBrew Autotune** (maker: Adin Walls).
+They show up as **TuneBrew Autotune** and **LevelBrew Vocal Rider** (maker: Adin Walls).
 
 ### Uninstall
 
 ```bash
 ./uninstall.sh
 ```
-Or delete `~/.lv2/TuneBrew.lv2`, `~/.vst3/TuneBrew.vst3`, `~/.clap/TuneBrew.clap` and `~/.vst/TuneBrew-vst.so`.
+Or delete `TuneBrew.*` / `LevelBrew.*` from `~/.lv2`, `~/.vst3`, `~/.clap` and `~/.vst`.
 
 ---
+
+# TuneBrew Autotune
 
 ## Quick start
 
@@ -157,13 +162,77 @@ Example audio is in [`demo/`](demo). Compare `vibrato_vocal_hardtune_CLASSIC.wav
 
 Measured on synthetic vocals with ±40-cent detuning and vibrato: mean error after hard-tune is **0.2–0.5 cents** (from ~23 cents). Hard-tuned output sits within 7.7 dB log-spectral distance of a perfect-pitch reference (v1.1: 11.8 dB). Pass-through at zero correction measures 50+ dB SNR. Tested at 44.1, 48, 88.2 and 96 kHz. CPU is around 2% of one core, stereo, at 48 kHz.
 
+# LevelBrew Vocal Rider
+
+![LevelBrew Vocal Rider](docs/levelbrew.png)
+
+A vocal rider for takes you've already recorded. Instead of reacting as the audio goes past, LevelBrew **reads the whole vocal file first**, so it knows every phrase in advance and can ride the level smoothly, the way you'd ride a fader by hand. Then, during playback, you **watch it work**: a scrolling view of the original level, the levelled vocal and the ride curve, plus a fader that moves with the ride.
+
+## Quick start
+
+1. Put LevelBrew **first** on the vocal track, before EQ, compression or effects.
+2. Click **LOAD** and choose the recorded vocal file (WAV). In Mixbus/Ardour the recordings are in your session folder under `interchange/<session name>/audiofiles/`.
+3. Press **play**. Within a few seconds of singing, LevelBrew recognises the take and locks to it ("Locked: take starts at ..."). From then on it rides the vocal wherever you play, loop or seek.
+4. Adjust **Strength**, **Range** and **Speed** to taste. The defaults are a moderate, natural ride.
+
+The sync position is saved with your session, so next time it rides straight away.
+
+## How it behaves
+
+- **Reads the file without playback.** The whole take is analysed in the background in well under a second.
+- **Watches the file.** If the WAV changes on disk (re-recorded, edited, bounced over), LevelBrew re-reads it by itself once it stops changing, and keeps riding with the old version until the new one is ready.
+- **Finds the take on the timeline by itself.** It compares what it hears during playback with the file, so you don't have to type in where the region starts. If you move the region, it notices within a few seconds and re-syncs. **RE-SYNC** forces a fresh search.
+- **Doesn't pump.** Silences, breaths and "S" sounds are ignored when judging the level, gaps hold the neighbouring gain instead of jumping, and long silences relax back to 0 dB.
+- **No latency** and no lookahead delay: the ride is worked out in advance.
+
+## Controls
+
+| Control | What it does |
+|---|---|
+| **Strength** (%) | How much of the level difference to even out. 100% = fully level, 50% = halfway. Default 85% |
+| **Range** (dB) | Largest boost or cut it may apply. Default ±9 dB |
+| **Speed** (s) | How slowly it moves. Small = follows individual words, large = follows whole phrases. Default 0.4 s |
+| **Output** (dB) | Output trim |
+| **Bypass** | Compare with the original. The ride fades in and out over 300 ms, so there's no click |
+| **LOAD** | Choose the vocal file |
+| **RE-SYNC** | Find the take's timeline position again |
+
+## Good to know
+
+- It rides **one take (file)**. If your vocal track is a comp of several takes, load the main one. Regions from other files simply pass through unchanged.
+- Keep it first in the chain: it recognises the take by comparing its input with the file, so heavy processing before it makes syncing harder.
+- WAV/BWF files of any common bit depth (16/24/32-bit, float) and sample rate are supported, mono or stereo.
+- Not available as CLAP: DPF passes CLAP hosts a steady sample counter instead of the song position, which LevelBrew needs. Use LV2 or VST3.
+
+## How it works
+
+- **Level detection:** 40 ms windows every 10 ms, high-passed at 90 Hz so rumble doesn't count. "S" sounds are detected by their energy above 5 kHz and left out of the level estimate.
+- **Singing detection:** frames within 24 dB of the take's loud passages count as singing, with a 70 ms majority filter against flicker.
+- **Ride curve:** the local loudness is an energy average over nearby singing only (Gaussian, width set by Speed), compared to the take's own median level, scaled by Strength, limited by Range and smoothed again over ~120 ms.
+- **Sync:** during playback the plugin logs 10 ms input levels and slides them along the file's own levels; a near-perfect correlation (≥ 0.97, clearly ahead of any repeated chorus) locks the position. While locked it re-checks every 2 s.
+
+Measured on a real 3:50 vocal: the phrase-to-phrase level swing went from 2.3 dB to 0.9 dB at the default settings, using −4 to +6 dB of gain. In an end-to-end test of the plugin binary, it found the take's position to within 1 ms, matched the planned ride to within 0.01 dB, and re-read a changed file within 2.5 s.
+
+---
+
 ## Build details
 
 `make` builds every format into `bin/`, and `make install` (or `./install.sh`) copies them to your home plugin folders.
 
-Built on [DPF](https://github.com/DISTRHO/DPF) (ISC licence), included as a git submodule in `dpf/`. The DSP lives in `src/TuneEngine.hpp`, a header-only engine you can reuse. The editor is `src/TuneView.hpp`, plain Cairo with no framework dependency. Offline test scripts are in `test/`.
+Built on [DPF](https://github.com/DISTRHO/DPF) (ISC licence), included as a git submodule in `dpf/`.
+
+- **TuneBrew:** the DSP lives in `src/TuneEngine.hpp`, a header-only engine you can reuse, and the editor is `src/TuneView.hpp`.
+- **LevelBrew:** the analysis, ride curve, sync and player live in `src/LevelEngine.hpp`, and the editor is `src/LevelView.hpp`.
+
+Both editors are plain Cairo with no framework dependency. Test programs are in `test/`. For example, `test/level_vsthost.cpp` drives the LevelBrew binary like a DAW does.
 
 ## Changelog
+
+### LevelBrew
+
+- **1.0** First release.
+
+### TuneBrew
 
 - **1.4.3** Stronger lamp and LED glow.
 - **1.4.2** Plastic push buttons with glowing side lamps (key, mode, detect, apply/stop).
@@ -176,5 +245,5 @@ Built on [DPF](https://github.com/DISTRHO/DPF) (ISC licence), included as a git 
 
 ## Licence
 
-TuneBrew is free software under the **GNU General Public License v3.0**; see [LICENSE](LICENSE).
+TuneBrew and LevelBrew are free software under the **GNU General Public License v3.0**; see [LICENSE](LICENSE).
 The DPF framework is ISC-licensed. The speech in `demo/` comes from a public-domain LibriVox recording (via the librosa example data); the other demo vocals are synthesised.
