@@ -1,12 +1,10 @@
-// level_vsthost plugin.so take.wav changed.wav work.wav
-// Drives the real LevelBrew VST2 binary like a DAW: gives it the take via state,
-// plays it with the take placed at an unknown timeline position, then rewrites
-// the file on disk and checks the plugin re-scans it. Prints PASS / FAIL.
+// level_vsthost plugin.so take.wav changed.wav
+// Drives the real LevelBrew VST2 binary like a DAW: a scan pass (at export speed),
+// a ride pass, an edited take, a session save/reopen and Clear. PASS / FAIL.
 #include "../src/LevelParams.hpp"
 #include <dlfcn.h>
 #include <thread>
 #include <chrono>
-#include <fstream>
 using namespace levelbrew;
 
 struct AEffect;
@@ -39,101 +37,123 @@ static intptr_t hostCb(AEffect*, int32_t op, int32_t, intptr_t, void*, float)
     return 0;
 }
 
-static void copyFile(const char* a, const char* b) { std::ifstream i(a, std::ios::binary); std::ofstream o(b, std::ios::binary); o << i.rdbuf(); }
 
-int main(int argc, char** argv)
-{
-    const char *so = argv[1], *take = argv[2], *changed = argv[3], *work = argv[4];
-    copyFile(take, work);
-    void* lib = dlopen(so, RTLD_NOW);
-    if (!lib) { printf("dlopen: %s\n", dlerror()); return 1; }
-    auto entry = (AEffect* (*)(HostCb))dlsym(lib, "VSTPluginMain");
-    AEffect* fx = entry(hostCb);
-    const double sr = 44100; const int B = 512;
-    fx->dispatcher(fx, 0, 0, 0, nullptr, 0);          // open
-    fx->dispatcher(fx, 10, 0, 0, nullptr, (float)sr); // sample rate
-    fx->dispatcher(fx, 11, 0, B, nullptr, 0);         // block size
-    fx->dispatcher(fx, 12, 0, 1, nullptr, 0);         // resume
-    ti.sampleRate = sr; ti.tempo = 120; ti.timeSigNumerator = 4; ti.timeSigDenominator = 4;
-    printf("plugin params %d, in %d out %d\n", fx->numParams, fx->numInputs, fx->numOutputs);
-
-    // give it the file through state, like a session load
-    std::string chunk = std::string("file") + '\0' + work + '\0' + "offset" + '\0' + '\0' + '\0';
-    fx->dispatcher(fx, 24, 0, (intptr_t)chunk.size(), (void*)chunk.data(), 0);
-
-    Audio a; readWav(take, a);
-    std::vector<float> L(B), R(B), OL(B), OR(B);
-    float* ins[2] = { L.data(), R.data() }; float* outs[2] = { OL.data(), OR.data() };
-    auto outParam = [&](int p) { return kSpecs[p].min + fx->getParameter(fx, p) * (kSpecs[p].max - kSpecs[p].min); };
-    auto idle = [&](double secs) {
+struct Fx {
+    void* lib; AEffect* fx;
+    std::vector<float> L, R, OL, OR;
+    float* ins[2]; float* outs[2];
+    static constexpr int B = 512;
+    double sr;
+    Fx(const char* so, double s) : sr(s), L(B), R(B), OL(B), OR(B)
+    {
+        lib = dlopen(so, RTLD_NOW);
+        if (!lib) { printf("dlopen: %s\n", dlerror()); exit(1); }
+        auto entry = (AEffect* (*)(HostCb))dlsym(lib, "VSTPluginMain");
+        fx = entry(hostCb);
+        fx->dispatcher(fx, 0, 0, 0, nullptr, 0);
+        fx->dispatcher(fx, 10, 0, 0, nullptr, (float)sr);
+        fx->dispatcher(fx, 11, 0, B, nullptr, 0);
+        fx->dispatcher(fx, 12, 0, 1, nullptr, 0);
+        ins[0] = L.data(); ins[1] = R.data(); outs[0] = OL.data(); outs[1] = OR.data();
+    }
+    ~Fx() { fx->dispatcher(fx, 12, 0, 0, nullptr, 0); fx->dispatcher(fx, 1, 0, 0, nullptr, 0); }
+    float out(int p) { return kSpecs[p].min + fx->getParameter(fx, p) * (kSpecs[p].max - kSpecs[p].min); }
+    void idle(double secs)
+    {
         ti.flags = 0;
         std::fill(L.begin(), L.end(), 0.f); std::fill(R.begin(), R.end(), 0.f);
         for (int i = 0; i < (int)(secs * 20); ++i) { fx->processReplacing(fx, ins, outs, B); std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
-    };
-    const double region = 12.37;
-    int fails = 0;
-    // play a stretch of the timeline; returns rms error vs the ideal curve after it has synced
-    auto play = [&](const Audio& src, const Curve& ideal, double from, double secs, const char* name) {
+    }
+    // play the timeline [from, to) with `src` placed at `region`, at `speed` x real time.
+    // Returns rms error of applied gain vs `ideal` where the plugin is riding, plus the
+    // share of singing time it was riding and the largest gain applied (for scan passes).
+    void play(const std::vector<float>& src, double region, double from, double to, const Curve* ideal,
+              double& err, double& ridingShare, double& maxGain, double speed = 1.0)
+    {
         int64_t pos = (int64_t)(from * sr);
-        double err2 = 0; long n = 0; double syncedAt = -1;
-        for (int b = 0; b < (int)(secs * sr / B); ++b, pos += B) {
+        double e2 = 0; long n = 0, act = 0, rid = 0; maxGain = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        for (; pos < (int64_t)(to * sr); pos += B) {
             for (int i = 0; i < B; ++i) {
-                const int64_t k = pos + i - (int64_t)(region * sr);
-                L[i] = R[i] = (k >= 0 && k < (int64_t)src.mono.size()) ? src.mono[k] : 0.f;
+                const int64_t k = pos + i - (int64_t)std::llround(region * sr);
+                L[i] = R[i] = (k >= 0 && k < (int64_t)src.size()) ? src[(size_t)k] : 0.f;
             }
             ti.samplePos = (double)pos; ti.flags = 2;   // playing
             fx->processReplacing(fx, ins, outs, B);
-            if (b % 8 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));   // let the worker thread run
-            const bool locked = std::lround(outParam(pOutAlign)) == kAlignLocked;
-            if (locked && syncedAt < 0) syncedAt = (pos - from * sr) / sr;
-            if (locked && (pos - from * sr) / sr > syncedAt + 0.35) {
-                double ei = 0, eo = 0;
-                for (int i = 0; i < B; ++i) { ei += (double)L[i] * L[i]; eo += (double)OL[i] * OL[i]; }
-                if (ei > B * 1e-6) {
-                    const double got = 10 * std::log10(eo / ei);
-                    const double want = ideal.at((pos + B / 2) / sr - region);
-                    err2 += (got - want) * (got - want); ++n;
-                }
-            }
+            // pace like a real (or freewheeling) engine
+            const double due = (pos - from * sr + B) / sr / speed;
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (due > el) std::this_thread::sleep_for(std::chrono::duration<double>(due - el));
+            double ei = 0, eo = 0;
+            for (int i = 0; i < B; ++i) { ei += (double)L[i] * L[i]; eo += (double)OL[i] * OL[i]; }
+            if (ei < B * 1e-6) continue;
+            const double got = 10 * std::log10(eo / ei);
+            maxGain = std::max(maxGain, std::fabs(got));
+            if (!ideal) continue;
+            bool ok; const float want = ideal->at(pos + B / 2, ok);
+            if (!ok) continue;
+            ++act;
+            if (out(pOutRiding) > 0.5f && (pos - from * sr) / sr > 0.5) { ++rid; e2 += (got - want) * (got - want); ++n; }
         }
-        const double rms = n ? std::sqrt(err2 / n) : 99;
-        printf("%-34s synced after %5.1fs, take start %.3fs, gain error rms %.3f dB\n", name, syncedAt, outParam(pOutOffset), rms);
-        return rms;
-    };
-    auto idealFor = [&](const char* path) {
-        Audio x; readWav(path, x); Analysis an; analyse(x, an);
-        Curve c; c.sr = an.sr; c.duration = an.duration; c.hop = an.hop; c.win = an.win; c.g = gainCurve(an, RideSettings());
-        return c;
-    };
+        err = n ? std::sqrt(e2 / n) : 99; ridingShare = act ? (double)rid / act : 0;
+        idle(0.5);   // transport stops
+    }
+};
 
-    idle(3.0);
-    printf("status after load: %d (2 = ready), file version %d\n", (int)std::lround(outParam(pOutStatus)), (int)std::lround(outParam(pOutFileVer)));
-    if (std::lround(outParam(pOutStatus)) != kReady) { printf("FAIL: file not loaded\n"); return 1; }
-    const Curve c1 = idealFor(take);
+int main(int argc, char** argv)
+{
+    const char *so = argv[1], *take = argv[2], *changed = argv[3];
+    Audio a, b; readWav(take, a); readWav(changed, b);
+    const double sr = a.sr, region = 12.37, end = region + a.mono.size() / sr + 0.5;
+    const int64_t off = (int64_t)std::llround(region * sr);
+    auto ideal1 = buildCurve(analyseAudio(a, off), RideSettings());
+    auto ideal2 = buildCurve(analyseAudio(b, off), RideSettings());
+    ti.sampleRate = sr; ti.tempo = 120; ti.timeSigNumerator = 4; ti.timeSigDenominator = 4;
+    int fails = 0;
+    auto check = [&](bool ok, const char* what) { printf("  %s %s\n", ok ? "ok  " : "FAIL", what); fails += !ok; };
+    double err, share, mx;
+    std::string saved;
+    {
+        Fx p(so, sr);
+        printf("plugin loaded: %d params\n", p.fx->numParams);
+        p.idle(0.5);
+        check(std::lround(p.out(pOutState)) == kScanEmpty, "starts with nothing scanned");
 
-    if (play(a, c1, 60, 25, "play from 1:00 (first sync)") > 0.15) ++fails;
-    if (play(a, c1, 150, 10, "seek to 2:30 (already synced)") > 0.15) ++fails;
+        // scan pass, like exporting the track (freewheel, 40x real time)
+        p.play(a.mono, region, 0, end, nullptr, err, share, mx, 40.0);
+        printf("scan pass (export speed): largest gain applied %.3f dB, scanned %.1f s, state %d\n", mx, p.out(pOutScanned), (int)std::lround(p.out(pOutState)));
+        check(mx < 0.05, "the scan pass leaves the audio untouched");
+        check(p.out(pOutScanned) > a.mono.size() / sr && std::lround(p.out(pOutState)) == kScanReady, "whole take scanned and ready");
 
-    void* p = nullptr;
-    const intptr_t sz = fx->dispatcher(fx, 23, 0, 0, &p, 0);
-    std::string saved((const char*)p, sz);
-    const size_t o = saved.find(std::string("offset") + '\0');
-    printf("saved session state: offset = \"%s\"\n", o == std::string::npos ? "?" : saved.c_str() + o + 7);
-    if (o == std::string::npos || std::fabs(std::atof(saved.c_str() + o + 7) - region) > 0.011) ++fails;
+        p.play(a.mono, region, 60, 75, ideal1.get(), err, share, mx);
+        printf("ride pass 1:00-1:15: riding %.0f%% of singing, gain error rms %.3f dB\n", share * 100, err);
+        check(share > 0.9 && err < 0.1, "rides the take on the next playback");
 
-    // the take is changed on disk (re-recorded / edited): plugin must re-scan by itself
-    const int ver0 = (int)std::lround(outParam(pOutFileVer));
-    copyFile(changed, work);
-    double waited = 0;
-    while (waited < 8 && (int)std::lround(outParam(pOutFileVer)) == ver0) { idle(0.25); waited += 0.25; }
-    printf("file changed on disk: re-scanned after %.2fs (version %d -> %d)\n", waited, ver0, (int)std::lround(outParam(pOutFileVer)));
-    if ((int)std::lround(outParam(pOutFileVer)) == ver0) ++fails;
-    Audio a2; readWav(changed, a2);
-    const Curve c2 = idealFor(changed);
-    if (play(a2, c2, 105, 20, "play changed take from 1:45") > 0.15) ++fails;
+        // the vocal is edited (95-120 s of the take 8 dB quieter); play through it twice
+        p.play(b.mono, region, 100, 140, ideal2.get(), err, share, mx);
+        printf("edited take, first play: riding %.0f%% of the edited take's singing\n", share * 100);
+        p.play(b.mono, region, 100, 140, ideal2.get(), err, share, mx);
+        printf("edited take, second play: riding %.0f%%, gain error rms %.3f dB\n", share * 100, err);
+        check(share > 0.9 && err < 0.3, "re-scans the edit and rides it from the next pass");
 
-    fx->dispatcher(fx, 12, 0, 0, nullptr, 0);
-    fx->dispatcher(fx, 1, 0, 0, nullptr, 0);   // close
+        void* ptr = nullptr;
+        const intptr_t sz = p.fx->dispatcher(p.fx, 23, 0, 0, &ptr, 0);
+        saved.assign((const char*)ptr, (size_t)sz);
+        printf("session state: %.0f KB\n", sz / 1024.0);
+    }
+    {   // reopen the session in a fresh instance
+        Fx p(so, sr);
+        p.fx->dispatcher(p.fx, 24, 0, (intptr_t)saved.size(), (void*)saved.data(), 0);
+        p.idle(0.5);
+        printf("reopened: scanned %.1f s, state %d\n", p.out(pOutScanned), (int)std::lround(p.out(pOutState)));
+        p.play(b.mono, region, 150, 165, ideal2.get(), err, share, mx);
+        printf("reopened, play 2:30-2:45: riding %.0f%%, gain error rms %.3f dB\n", share * 100, err);
+        check(share > 0.9 && err < 0.3, "a reopened session rides without re-scanning");
+
+        p.fx->setParameter(p.fx, pClear, 1.f);
+        p.idle(0.5);
+        check(std::lround(p.out(pOutState)) == kScanEmpty, "Clear forgets the scan");
+    }
     printf(fails ? "FAIL\n" : "PASS\n");
     return fails;
 }

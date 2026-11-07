@@ -6,14 +6,13 @@ namespace levelbrew {
 
 enum ParamId {
     // inputs
-    pStrength = 0, pRange, pSpeed, pOutput, pBypass, pRealign,
+    pStrength = 0, pRange, pSpeed, pOutput, pBypass, pClear,
     // outputs (meters / status)
-    pOutGain, pOutPos, pOutStatus, pOutAlign, pOutOffset, pOutIn, pOutOut, pOutActivity, pOutFileVer,
+    pOutGain, pOutPos, pOutState, pOutScanned, pOutIn, pOutOut, pOutActivity, pOutRiding,
     pCount
 };
 
-enum Status { kNoFile = 0, kLoading, kReady, kError };
-enum Align { kAlignIdle = 0, kAlignListening, kAlignLocked };
+enum ScanState { kScanEmpty = 0, kScanScanning, kScanReady };
 
 struct ParamSpec { const char* label; float min, max, def; float skew; bool integer; bool bipolar; const char* unit; };
 
@@ -23,16 +22,15 @@ static const ParamSpec kSpecs[pCount] = {
     { "SPEED",      0.1f, 2.0f, 0.4f, 1.8f, false, false, "s" },
     { "OUTPUT",   -24, 12, 0, 1, false, true, "dB" },
     { "Bypass",     0, 1, 0, 1, true, false, "" },
-    { "Re-align",   0, 1, 0, 1, true, false, "" },
+    { "Clear Scan", 0, 1, 0, 1, true, false, "" },
     { "Ride",     -18, 18, 0, 1, false, true, "dB" },
-    { "Position",  -1, 36000, -1, 1, false, false, "s" },
-    { "Status",     0, 3, 0, 1, true, false, "" },
-    { "Align",      0, 2, 0, 1, true, false, "" },
-    { "Offset", -36000, 36000, 0, 1, false, false, "s" },
+    { "Position",  -1, 86400, -1, 1, false, false, "s" },
+    { "Scan",       0, 2, 0, 1, true, false, "" },
+    { "Scanned",    0, 86400, 0, 1, false, false, "s" },
     { "In",       -90, 6, -90, 1, false, false, "dB" },
     { "Out",      -90, 6, -90, 1, false, false, "dB" },
     { "Activity",   0, 1000, 0, 1, true, false, "" },
-    { "File",       0, 1000000, 0, 1, true, false, "" },
+    { "Riding",     0, 1, 0, 1, true, false, "" },
 };
 
 inline RideSettings settingsFrom(const float* v)

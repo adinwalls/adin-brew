@@ -15,7 +15,7 @@ Real-time pitch correction that tunes hard and still sounds human. It keeps vibr
 
 [![LevelBrew Vocal Rider](docs/levelbrew.png)](plugins/LevelBrew/README.md)
 
-Automatic level riding for a recorded vocal. It reads the whole take first, then rides the level smoothly during playback while you watch the fader move. It finds the take on your timeline by itself and re-reads the file when it changes.
+Automatic level riding for a recorded vocal. It scans the vocal on its own track: play it once, or export it to scan it in seconds. Then it rides the level smoothly on every playback while you watch the fader move. Edits to the take are picked up as you play.
 **[Read the LevelBrew guide →](plugins/LevelBrew/README.md)**
 
 **Formats:** LV2, VST3 and VST2 (64-bit Linux), plus CLAP for TuneBrew. They work in Harrison Mixbus, Ardour, REAPER, Bitwig Studio, Carla and other Linux DAWs.
@@ -111,9 +111,9 @@ Or delete `TuneBrew.*` / `LevelBrew.*` from `~/.lv2`, `~/.vst3`, `~/.clap` and `
 Built on [DPF](https://github.com/DISTRHO/DPF) (ISC licence), included as a git submodule in `dpf/`.
 
 - **TuneBrew:** the DSP lives in `src/TuneEngine.hpp`, a header-only engine you can reuse, and the editor is `src/TuneView.hpp`.
-- **LevelBrew:** the analysis, ride curve, sync and player live in `src/LevelEngine.hpp`, and the editor is `src/LevelView.hpp`.
+- **LevelBrew:** the track scanner, ride curve and player live in `src/LevelEngine.hpp`, and the editor is `src/LevelView.hpp`.
 
-Both editors are plain Cairo with no framework dependency. Test programs are in `test/`. For example, `test/level_vsthost.cpp` drives the LevelBrew binary like a DAW does.
+Both editors are plain Cairo with no framework dependency. Test programs are in `test/`. For example, `test/level_workflow.cpp` simulates scanning, riding and editing a take on the engine, and `test/level_vsthost.cpp` drives the LevelBrew binary like a DAW does.
 
 ## Changelog
 

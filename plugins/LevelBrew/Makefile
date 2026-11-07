@@ -11,5 +11,5 @@ include ../../dpf/Makefile.plugins.mk
 LINK_FLAGS += -static-libstdc++ -static-libgcc -pthread
 BUILD_CXX_FLAGS += -std=gnu++17 -pthread
 # no CLAP: DPF passes CLAP hosts a steady sample counter, not the song position LevelBrew needs
-TARGETS += lv2_sep vst2 vst3
+TARGETS += lv2 vst2 vst3
 all: $(TARGETS)

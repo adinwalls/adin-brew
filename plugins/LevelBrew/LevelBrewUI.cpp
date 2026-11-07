@@ -1,4 +1,5 @@
 #include "DistrhoUI.hpp"
+#include "LevelBrewPlugin.hpp"
 #include "../../src/LevelView.hpp"
 #include <chrono>
 
@@ -14,6 +15,9 @@ public:
           view(this),
           t0(std::chrono::steady_clock::now())
     {
+        // the editor draws straight from the plugin's scan (same process)
+        plugin = static_cast<LevelBrewPlugin*>(static_cast<Plugin*>(getPluginInstancePointer()));
+        view.setCurve(nullptr, plugin != nullptr);
     }
 
 protected:
@@ -24,22 +28,13 @@ protected:
         if (index < levelbrew::pOutGain) repaint();
     }
 
-    void stateChanged(const char* key, const char* value) override
-    {
-        if (std::strcmp(key, "file") == 0) { view.setFile(value); repaint(); }
-    }
-
     void uiIdle() override
     {
+        if (plugin) {
+            const uint32_t v = plugin->displayVersion();
+            if (v != seenVersion) { seenVersion = v; view.setCurve(plugin->display()); }
+        }
         view.tick(now());
-        repaint();
-    }
-
-    void uiFileBrowserSelected(const char* filename) override
-    {
-        if (filename == nullptr) return;
-        setState("file", filename);
-        view.setFile(filename);
         repaint();
     }
 
@@ -47,12 +42,6 @@ protected:
     void setParam(int index, float value) override { setParameterValue((uint32_t)index, value); repaint(); }
     void beginEdit(int index) override { editParameter((uint32_t)index, true); }
     void endEdit(int index) override { editParameter((uint32_t)index, false); }
-    void openFile() override
-    {
-        FileBrowserOptions opts;
-        opts.title = "Choose the recorded vocal (WAV)";
-        openFileBrowser(opts);
-    }
 
     // ---- drawing & input ----
     void onCairoDisplay(const CairoGraphicsContext& context) override
@@ -91,6 +80,8 @@ private:
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
+    LevelBrewPlugin* plugin = nullptr;
+    uint32_t seenVersion = 0;
     levelbrew::LevelView view;
     std::chrono::steady_clock::time_point t0;
 

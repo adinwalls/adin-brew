@@ -1,11 +1,7 @@
 // LevelView — the LevelBrew editor, drawn with Cairo in the same 500-series
 // rack style as TuneBrew. Framework-agnostic: the DPF UI (or a test renderer)
-// feeds it parameter values, the chosen file and mouse events in logical
-// coordinates (kW x kH), and receives edits via Host.
-//
-// The editor reads and analyses the vocal file itself (in a background thread)
-// so it can draw the whole take and its gain curve, even when the DSP runs in
-// another process.
+// feeds it parameter values, the plugin's latest scan + ride curve and mouse
+// events in logical coordinates (kW x kH), and receives edits via Host.
 #pragma once
 #include <cairo/cairo.h>
 #include <cmath>
@@ -13,9 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 #include "LevelParams.hpp"
 
@@ -31,7 +25,6 @@ public:
         virtual void setParam(int index, float value) = 0;
         virtual void beginEdit(int index) = 0;
         virtual void endEdit(int index) = 0;
-        virtual void openFile() = 0;
         virtual ~Host() {}
     };
 
@@ -39,46 +32,26 @@ public:
     {
         for (int i = 0; i < pCount; ++i) values[i] = kSpecs[i].def;
     }
-    ~LevelView() { if (loader.joinable()) loader.join(); }
 
     // ---------------- inputs ----------------
-    void setValue(int i, float v)
-    {
-        if (i < 0 || i >= pCount) return;
-        const float old = values[i];
-        values[i] = v;
-        if ((i == pStrength || i == pRange || i == pSpeed) && old != v) curveDirty = true;
-        if (i == pOutFileVer && old != v && !path.empty()) startLoad();   // DSP re-scanned the file
-    }
+    void setValue(int i, float v) { if (i >= 0 && i < pCount) values[i] = v; }
     float getValue(int i) const { return values[i]; }
-
-    void setFile(const char* p)
-    {
-        const std::string np = p ? p : "";
-        if (np == path) return;
-        path = np;
-        startLoad();
-    }
+    // latest scan + ride curve from the plugin (nullptr: editor can't reach the plugin)
+    void setCurve(std::shared_ptr<const Curve> c, bool reachable = true) { cur = std::move(c); linked = reachable; }
 
     // call at UI refresh rate with a monotonically increasing time in seconds
     void tick(double now)
     {
         nowT = now;
         if (values[pOutActivity] != lastActivity) { lastActivity = values[pOutActivity]; lastActivityT = now; }
-        running = now - lastActivityT < 0.3;
-        {   // pick up a finished background load
-            std::lock_guard<std::mutex> l(loadMx);
-            if (loaded) { an = std::move(loaded); curveDirty = true; }
-        }
-        if (curveDirty && an) { float v[pCount]; std::memcpy(v, values, sizeof v); curve = gainCurve(*an, settingsFrom(v)); curveDirty = false; }
+        const bool alive = lastActivityT > 0 && now - lastActivityT < 0.3;   // the plugin is processing audio
         const float pos = values[pOutPos];
-        if (running && pos > -0.5f) { viewPos = pos; havePos = true; }
+        running = alive && pos > -0.5f;                                    // ...and the transport is rolling
+        if (running) { viewPos = pos; havePos = true; }
         rideShown += (values[pOutGain] - rideShown) * 0.35f;
-        const float in = running ? values[pOutIn] : -90.f, out = running ? values[pOutOut] : -90.f;
+        const float in = alive ? values[pOutIn] : -90.f, out = alive ? values[pOutOut] : -90.f;
         meterIn = std::max(in, meterIn - 1.2f); meterOut = std::max(out, meterOut - 1.2f);
     }
-
-    bool isLoading() const { return loading; }
 
     // ---------------- drawing ----------------
     void draw(cairo_t* cr, double pixelW, double pixelH)
@@ -106,9 +79,12 @@ public:
     bool mouseDown(double x, double y, bool fine, double timeSec)
     {
         x -= kCheek;
-        if (inRect(x, y, kLoadBtn) || inRect(x, y, kFileBox)) { host->openFile(); return true; }
+        if (inRect(x, y, kClearBtn)) {
+            if (hasScan() && timeSec - clearArmT < 2.0) { commit(pClear, 1.f); values[pClear] = 0; clearArmT = -10; }
+            else clearArmT = timeSec;   // click twice to clear (protects the scan)
+            return true;
+        }
         if (inRect(x, y, kBypassBtn)) { commit(pBypass, values[pBypass] > 0.5f ? 0.f : 1.f); return true; }
-        if (inRect(x, y, kAlignBtn) && an) { commit(pRealign, 1.f); values[pRealign] = 0; return true; }
         const int k = knobAt(x, y);
         if (k >= 0) {
             const int p = kKnobParams[k];
@@ -135,7 +111,7 @@ public:
     {
         x -= kCheek;
         hoverKnob = knobAt(x, y);
-        hoverBtn = inRect(x, y, kLoadBtn) || inRect(x, y, kFileBox) ? 1 : inRect(x, y, kBypassBtn) ? 2 : inRect(x, y, kAlignBtn) ? 3 : 0;
+        hoverBtn = inRect(x, y, kClearBtn) ? 1 : inRect(x, y, kBypassBtn) ? 2 : 0;
         if (dragKnob < 0) return false;
         const int p = kKnobParams[dragKnob];
         if (fine != dragFine) { dragNorm = toNorm(p, values[p]); dragY = y; dragFine = fine; }
@@ -159,15 +135,10 @@ private:
     // ---------------- data ----------------
     Host* host;
     float values[pCount];
-    std::string path;
-    std::unique_ptr<Analysis> an, loaded;
-    std::vector<float> curve;
-    bool curveDirty = false, loading = false;
-    std::string loadError;
-    std::mutex loadMx;
-    std::thread loader;
-    double nowT = 0, lastActivityT = -10;
-    float lastActivity = -1;
+    std::shared_ptr<const Curve> cur;
+    bool linked = true;
+    double nowT = 0, lastActivityT = -10, clearArmT = -10;
+    float lastActivity = 0;
     bool running = false, havePos = false;
     double viewPos = 0;
     float rideShown = 0, meterIn = -90, meterOut = -90;
@@ -176,32 +147,15 @@ private:
     double dragY = 0, dragNorm = 0, lastClickTime = -10;
     bool dragFine = false;
 
-    void startLoad()
-    {
-        if (loader.joinable()) loader.join();
-        { std::lock_guard<std::mutex> l(loadMx); loaded.reset(); }
-        if (path.empty()) { an.reset(); curve.clear(); loadError.clear(); return; }
-        loading = true;
-        const std::string p = path;
-        loader = std::thread([this, p] {
-            Audio a;
-            std::unique_ptr<Analysis> res;
-            std::string err;
-            if (readWav(p.c_str(), a)) { res.reset(new Analysis); analyse(a, *res); }
-            else err = a.error;
-            std::lock_guard<std::mutex> l(loadMx);
-            if (res) loaded = std::move(res);
-            loadError = err;
-            loading = false;
-        });
-    }
+    bool hasScan() const { return cur && cur->an.frames() > 0 && values[pOutScanned] > 0.f; }
+    int scanState() const { return (int)std::lround(values[pOutState]); }
+    bool riding() const { return running && values[pOutRiding] > 0.5f && !bypassed(); }
 
     // ---------------- layout ----------------
     struct Rect { double x, y, w, h; };
-    static constexpr Rect kFileBox   = { 250, 14, 370, 34 };
-    static constexpr Rect kLoadBtn   = { 630, 14, 96, 34 };
+    static constexpr Rect kScanBox   = { 250, 14, 370, 34 };
+    static constexpr Rect kClearBtn  = { 630, 14, 96, 34 };
     static constexpr Rect kBypassBtn = { 738, 14, 100, 34 };
-    static constexpr Rect kAlignBtn  = { 722, 64, 116, 30 };
     static constexpr Rect kOverview  = { 24, 106, 812, 40 };
     static constexpr Rect kGraph     = { 24, 158, 588, 206 };
     static constexpr Rect kFaderWin  = { 624, 158, 212, 206 };
@@ -421,24 +375,28 @@ private:
     {
         const bool neg = t < 0; t = std::fabs(t);
         const int m = (int)(t / 60); const double s = t - m * 60;
-        std::snprintf(buf, n, "%s%d:%05.2f", neg ? "-" : "", m, s);
-    }
-    std::string fileName() const
-    {
-        const size_t sl = path.find_last_of('/');
-        return sl == std::string::npos ? path : path.substr(sl + 1);
+        std::snprintf(buf, n, "%s%d:%04.1f", neg ? "-" : "", m, s);
     }
     bool bypassed() const { return values[pBypass] > 0.5f; }
-    int status() const { return (int)std::lround(values[pOutStatus]); }
-    int align() const { return (int)std::lround(values[pOutAlign]); }
 
-    // centre of the scrolling graph (take time, s)
+    // first and last singing on the timeline (s)
+    void singingSpan(double& a, double& b) const
+    {
+        a = cur->an.startTime(); b = cur->an.endTime();
+        const Analysis& an = cur->an;
+        size_t i0 = 0, i1 = an.frames();
+        while (i0 < i1 && !an.on[i0]) ++i0;
+        while (i1 > i0 && !an.on[i1 - 1]) --i1;
+        if (i0 < i1) { a = an.frameTime(i0); b = an.frameTime(i1 - 1); }
+    }
+
+    // centre of the scrolling graph (timeline s)
     double graphCentre() const
     {
         if (havePos) return viewPos;
-        if (!an) return 0;
-        for (size_t i = 0; i < an->frames(); ++i) if (an->on[i]) return an->frameTime(i) + kWindow * 0.3;
-        return kWindow * 0.5;
+        if (!hasScan()) return 0;
+        double a, b; singingSpan(a, b);
+        return a + kWindow * 0.3;
     }
 
     // ---------------- panels ----------------
@@ -464,8 +422,7 @@ private:
 
     void drawHeader(cairo_t* cr)
     {
-        // logo mark: a fader with a ride arrow
-        {
+        {   // logo mark: a fader with a ride arrow
             const double fx = 40;
             cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
             rgb(cr, kAmber, 0.18); cairo_set_line_width(cr, 7);
@@ -484,84 +441,77 @@ private:
         rgb(cr, kPrint); text(cr, "by Adin Walls", 68, 50, 11, -1);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
 
-        // file window
-        window(cr, kFileBox, 5);
-        if (path.empty()) { rgb(cr, kDim); text(cr, "No vocal file loaded", kFileBox.x + 12, kFileBox.y + 22, 12, -1); }
-        else { rgb(cr, hoverBtn == 1 ? kAmber : kText); textFit(cr, fileName(), kFileBox.x + 12, kFileBox.y + 22, 12.5, kFileBox.w - 24); }
-        rgb(cr, kPrint); text(cr, "VOCAL TAKE", kFileBox.x + 4, kFileBox.y - 3, 7, -1);
-
-        pushButton(cr, kLoadBtn, "LOAD", false, kGreen, hoverBtn == 1, 11, 0);
+        // scan readout
+        window(cr, kScanBox, 5);
+        rgb(cr, kPrint); text(cr, "TRACK SCAN", kScanBox.x + 4, kScanBox.y - 3, 7, -1);
+        char buf[96];
+        if (!linked) { rgb(cr, kRed); text(cr, "Editor can't reach the plugin", kScanBox.x + 12, kScanBox.y + 22, 12, -1); }
+        else if (!hasScan()) { rgb(cr, kDim); text(cr, "Nothing scanned yet", kScanBox.x + 12, kScanBox.y + 22, 12.5, -1); }
+        else {
+            char a[24], b[24], d[24]; double s0, s1; singingSpan(s0, s1);
+            fmtTime(values[pOutScanned], d, sizeof d); fmtTime(s0, a, sizeof a); fmtTime(s1, b, sizeof b);
+            std::snprintf(buf, sizeof buf, "%s scanned   vocal %s - %s", d, a, b);
+            rgb(cr, kText); text(cr, buf, kScanBox.x + 12, kScanBox.y + 22, 12.5, -1);
+        }
+        const bool armed = nowT - clearArmT < 2.0;
+        pushButton(cr, kClearBtn, armed ? "SURE?" : "CLEAR", armed, kRed, hoverBtn == 1, 11, 0, !hasScan());
         pushButton(cr, kBypassBtn, "BYPASS", bypassed(), kRed, hoverBtn == 2);
     }
 
     void drawStatus(cairo_t* cr)
     {
-        char buf[160], t1[32];
-        // file status
-        C c = kDim; double on = 0;
-        const int st = status();
-        if (path.empty()) std::snprintf(buf, sizeof buf, "Click LOAD and choose the recorded vocal (WAV)");
-        else if (st == kLoading || loading) { std::snprintf(buf, sizeof buf, "Reading the take..."); c = kYellow; on = 0.5 + 0.5 * std::sin(nowT * 8); }
-        else if (st == kError || (!an && !loadError.empty())) {
-            std::snprintf(buf, sizeof buf, "Can't read the file%s%s", loadError.empty() ? "" : ": ", loadError.c_str()); c = kRed; on = 1;
-        } else if (an) {
-            fmtTime(an->duration, t1, sizeof t1);
-            std::snprintf(buf, sizeof buf, "Take analysed: %s, %.1f kHz. Watching for changes.", t1, an->sr / 1000.0); c = kGreen; on = 1;
-        } else std::snprintf(buf, sizeof buf, "Waiting for the plugin...");
+        const char* msg; C c = kDim; double on = 0;
+        const int st = scanState();
+        const double blink = 0.5 + 0.5 * std::sin(nowT * 8);
+        if (!linked) { msg = "Open this plugin in a host that runs the editor alongside it (LV2, VST3 or VST2)."; c = kRed; on = 1; }
+        else if (st == kScanEmpty || !hasScan()) {
+            msg = running ? "Scanning the track..." : "Play the vocal track through once to scan it. Exporting the track scans it faster.";
+            if (running) { c = kYellow; on = blink; }
+        } else if (st == kScanScanning) { msg = "Scanning... this part rides from the next playback."; c = kYellow; on = blink; }
+        else if (bypassed()) { msg = "Bypassed."; c = kRed; on = 1; }
+        else if (riding()) { msg = "Riding. Any changes to the take are picked up as you play."; c = kAccent; on = 1; }
+        else if (running) { msg = "Playing a part that hasn't been scanned yet."; c = kYellow; on = blink; }
+        else { msg = "Scanned and ready. Press play."; c = kGreen; on = 1; }
         led(cr, 30, 79, 3.6, c, on);
-        rgb(cr, kPrint); text(cr, buf, 42, 83, 11, -1);
-
-        // alignment status
-        const int al = align();
-        C ac = kDim; double aon = 0;
-        if (an && st == kReady) {
-            if (al == kAlignLocked) {
-                fmtTime(values[pOutOffset], t1, sizeof t1);
-                std::snprintf(buf, sizeof buf, "Locked: take starts at %s", t1); ac = kAccent; aon = 1;
-            } else if (running) {
-                std::snprintf(buf, sizeof buf, "Listening for the take..."); ac = kYellow; aon = 0.5 + 0.5 * std::sin(nowT * 8);
-            } else std::snprintf(buf, sizeof buf, "Press play to sync");
-        } else buf[0] = 0;
-        if (buf[0]) { led(cr, 450, 79, 3.6, ac, aon); rgb(cr, kPrint); text(cr, buf, 462, 83, 11, -1); }
-        pushButton(cr, kAlignBtn, "RE-SYNC", false, kAccent, hoverBtn == 3, 10.5, 0, !an);
+        rgb(cr, kPrint); text(cr, msg, 42, 83, 11.5, -1);
     }
 
     void drawOverview(cairo_t* cr)
     {
         const Rect r = kOverview;
         window(cr, r, 4);
-        if (!an || an->peak.empty()) return;
+        if (!hasScan()) return;
+        const Analysis& an = cur->an;
         cairo_save(cr); rrect(cr, r.x, r.y, r.w, r.h, 4); cairo_clip(cr);
-        const double dur = an->duration, mid = r.y + r.h / 2;
-        const size_t np = an->peak.size();
+        double t0, t1; singingSpan(t0, t1);
+        t0 = std::max(an.startTime(), t0 - 2.0); t1 = std::min(an.endTime(), t1 + 2.0);
+        if (t1 - t0 < 1) t1 = t0 + 1;
+        const double mid = r.y + r.h / 2;
         const int W = (int)r.w;
-        // waveform (peak per pixel)
-        rgb(cr, kDim, 0.55);
+        auto frameAt = [&](double t) { return (long)((t * an.sr - 2.0 * an.hop) / an.hop) - (long)an.origin; };
         for (int px = 0; px < W; ++px) {
-            const size_t a = (size_t)((double)px / W * np), b = std::max(a + 1, (size_t)((double)(px + 1) / W * np));
-            float pk = 0; for (size_t i = a; i < std::min(b, np); ++i) pk = std::max(pk, an->peak[i]);
+            const long a = std::max(0L, frameAt(t0 + (t1 - t0) * px / W)), b = std::min((long)an.frames(), std::max(a + 1, frameAt(t0 + (t1 - t0) * (px + 1) / W)));
+            float pk = 0; bool fresh = false, valid = false;
+            for (long i = a; i < b; ++i) { pk = std::max(pk, an.peak[(size_t)i]); fresh |= an.fresh[(size_t)i] != 0; valid |= an.valid[(size_t)i] != 0; }
+            if (!valid) continue;
             const double h = std::min(1.0, std::sqrt((double)pk)) * (r.h / 2 - 3);
-            cairo_rectangle(cr, r.x + px, mid - h, 1, 2 * h);
+            rgb(cr, fresh ? kYellow : kDim, fresh ? 0.45 : 0.55);
+            cairo_rectangle(cr, r.x + px, mid - h, 1, 2 * h); cairo_fill(cr);
         }
-        cairo_fill(cr);
-        // ride curve, scaled to the window height
-        if (!curve.empty()) {
-            const double rng = std::max(1.0f, values[pRange]);
-            rgb(cr, kAmber, bypassed() ? 0.35 : 0.9); cairo_set_line_width(cr, 1.3);
-            for (int px = 0; px < W; ++px) {
-                const double g = gainAt(*an, curve, (px + 0.5) / W * dur);
-                const double y = mid - g / rng * (r.h / 2 - 4);
-                if (px == 0) cairo_move_to(cr, r.x + px, y); else cairo_line_to(cr, r.x + px, y);
-            }
-            cairo_stroke(cr);
+        const double rng = std::max(1.0f, values[pRange]);
+        rgb(cr, kAmber, bypassed() ? 0.35 : 0.9); cairo_set_line_width(cr, 1.3);
+        for (int px = 0; px < W; ++px) {
+            const double g = cur->atTime(t0 + (t1 - t0) * (px + 0.5) / W);
+            const double y = mid - g / rng * (r.h / 2 - 4);
+            if (px == 0) cairo_move_to(cr, r.x + px, y); else cairo_line_to(cr, r.x + px, y);
         }
-        // visible window + playhead
+        cairo_stroke(cr);
         const double c0 = graphCentre();
-        const double x0 = r.x + (c0 - kWindow * 0.4) / dur * r.w, x1 = r.x + (c0 + kWindow * 0.6) / dur * r.w;
+        const double x0 = r.x + (c0 - kWindow * 0.4 - t0) / (t1 - t0) * r.w, x1 = r.x + (c0 + kWindow * 0.6 - t0) / (t1 - t0) * r.w;
         cairo_set_source_rgba(cr, 1, 1, 1, 0.08); cairo_rectangle(cr, x0, r.y, x1 - x0, r.h); cairo_fill(cr);
         if (havePos) {
             rgb(cr, kText, running ? 0.9 : 0.5); cairo_set_line_width(cr, 1.5);
-            const double px = r.x + viewPos / dur * r.w;
+            const double px = r.x + (viewPos - t0) / (t1 - t0) * r.w;
             cairo_move_to(cr, px, r.y); cairo_line_to(cr, px, r.y + r.h); cairo_stroke(cr);
         }
         cairo_restore(cr);
@@ -574,7 +524,6 @@ private:
         rgb(cr, kPrint); text(cr, "RIDE", r.x + 4, r.y - 4, 7, -1);
         cairo_save(cr); rrect(cr, r.x, r.y, r.w, r.h, 6); cairo_clip(cr);
 
-        // level grid: top -6 dB .. bottom -60 dB
         const double topDb = -6, botDb = -54;
         auto yLev = [&](double db) { return r.y + 8 + (topDb - db) / (topDb - botDb) * (r.h - 16); };
         cairo_set_line_width(cr, 1);
@@ -582,57 +531,68 @@ private:
             rgb(cr, kDim, 0.12); cairo_move_to(cr, r.x, yLev(db)); cairo_line_to(cr, r.x + r.w, yLev(db)); cairo_stroke(cr);
             char b[16]; std::snprintf(b, sizeof b, "%.0f", db); rgb(cr, kDim, 0.5); text(cr, b, r.x + 6, yLev(db) - 3, 8, -1);
         }
-        if (!an) {
-            rgb(cr, kDim);
-            text(cr, path.empty() ? "Load the recorded vocal to see the ride" : (loading ? "Reading the take..." : ""), r.x + r.w / 2, r.y + r.h / 2, 13, 0);
-            cairo_restore(cr); return;
-        }
         const double c0 = graphCentre(), t0 = c0 - kWindow * 0.4, t1 = c0 + kWindow * 0.6;
         auto xT = [&](double t) { return r.x + (t - t0) / (t1 - t0) * r.w; };
-        const long f0 = std::max(0L, (long)((t0 * an->sr - an->win * 0.5) / an->hop) - 1);
-        const long f1 = std::min((long)an->frames() - 1, (long)((t1 * an->sr - an->win * 0.5) / an->hop) + 1);
-        const bool byp = bypassed();
-        auto frameG = [&](long i) { return curve.empty() || byp ? 0.0 : (double)curve[(size_t)i]; };
-
-        if (f1 > f0) {
-            // before: filled grey envelope
-            cairo_move_to(cr, xT(an->frameTime((size_t)f0)), r.y + r.h);
-            for (long i = f0; i <= f1; ++i) cairo_line_to(cr, xT(an->frameTime((size_t)i)), yLev(std::max(botDb - 6, an->lev[(size_t)i])));
-            cairo_line_to(cr, xT(an->frameTime((size_t)f1)), r.y + r.h); cairo_close_path(cr);
-            rgb(cr, kDim, 0.28); cairo_fill(cr);
-            // after: levelled vocal line (singing only)
-            rgb(cr, kAccent); cairo_set_line_width(cr, 1.6);
-            bool pen = false;
-            for (long i = f0; i <= f1; ++i) {
-                if (!an->on[(size_t)i]) { pen = false; continue; }
-                const double x = xT(an->frameTime((size_t)i)), y = yLev(an->lev[(size_t)i] + frameG(i));
-                if (pen) cairo_line_to(cr, x, y); else { cairo_move_to(cr, x, y); pen = true; }
+        if (hasScan()) {
+            const Analysis& an = cur->an;
+            const long f0 = std::max(0L, (long)((t0 * an.sr - 2.0 * an.hop) / an.hop) - (long)an.origin - 1);
+            const long f1 = std::min((long)an.frames() - 1, (long)((t1 * an.sr - 2.0 * an.hop) / an.hop) - (long)an.origin + 1);
+            const bool byp = bypassed();
+            auto frameG = [&](long i) { return byp ? 0.0 : (double)cur->g[(size_t)i]; };
+            if (f1 > f0) {
+                // before: filled grey envelope (scanned frames only)
+                bool pen = false; double lastX = 0;
+                for (long i = f0; i <= f1; ++i) {
+                    const bool v = an.valid[(size_t)i];
+                    const double x = xT(an.frameTime((size_t)i));
+                    if (v && !pen) { cairo_move_to(cr, x, r.y + r.h); pen = true; }
+                    if (v) { cairo_line_to(cr, x, yLev(std::max(botDb - 6, an.lev[(size_t)i]))); lastX = x; }
+                    if (pen && (!v || i == f1)) { cairo_line_to(cr, lastX, r.y + r.h); cairo_close_path(cr); pen = false; }
+                }
+                rgb(cr, kDim, 0.28); cairo_fill(cr);
+                // after: levelled vocal (singing only; yellow where it's only just been scanned)
+                cairo_set_line_width(cr, 1.6);
+                for (int pass = 0; pass < 2; ++pass) {
+                    rgb(cr, pass ? kYellow : kAccent, pass ? 0.8 : 1.0);
+                    pen = false;
+                    for (long i = f0; i <= f1; ++i) {
+                        if (!an.on[(size_t)i] || (an.fresh[(size_t)i] != 0) != (pass == 1)) { pen = false; continue; }
+                        const double x = xT(an.frameTime((size_t)i)), y = yLev(an.lev[(size_t)i] + (pass ? 0.0 : frameG(i)));
+                        if (pen) cairo_line_to(cr, x, y); else { cairo_move_to(cr, x, y); pen = true; }
+                    }
+                    cairo_stroke(cr);
+                }
+                // ride curve on its own +-range scale, centred in the window
+                const double rng = std::max(1.0f, values[pRange]), mid = r.y + r.h / 2, half = r.h / 2 - 14;
+                rgb(cr, kAmber, 0.25); cairo_set_line_width(cr, 1);
+                cairo_move_to(cr, r.x, mid); cairo_line_to(cr, r.x + r.w, mid); cairo_stroke(cr);
+                cairo_set_line_width(cr, 2.2);
+                for (int pass = 0; pass < 2; ++pass) {
+                    rgb(cr, kAmber, byp ? 0.3 : pass ? 0.3 : 1.0);
+                    pen = false;
+                    for (long i = f0; i <= f1; ++i) {
+                        if (!cur->ride[(size_t)i] != (pass == 1)) { pen = false; continue; }
+                        const double x = xT(an.frameTime((size_t)i)), y = mid - frameG(i) / rng * half;
+                        if (pen) cairo_line_to(cr, x, y); else { cairo_move_to(cr, x, y); pen = true; }
+                    }
+                    cairo_stroke(cr);
+                }
+                char b[24]; std::snprintf(b, sizeof b, "+%.0f dB", rng);
+                rgb(cr, kAmber, 0.8); text(cr, b, r.x + r.w - 6, mid - half - 2, 8, 1);
+                std::snprintf(b, sizeof b, "-%.0f dB", rng); text(cr, b, r.x + r.w - 6, mid + half + 9, 8, 1);
             }
-            cairo_stroke(cr);
-            // ride curve on its own +-range scale, centred in the window
-            const double rng = std::max(1.0f, values[pRange]), mid = r.y + r.h / 2, half = r.h / 2 - 14;
-            rgb(cr, kAmber, 0.25); cairo_set_line_width(cr, 1);
-            cairo_move_to(cr, r.x, mid); cairo_line_to(cr, r.x + r.w, mid); cairo_stroke(cr);
-            rgb(cr, kAmber, byp ? 0.3 : 1.0); cairo_set_line_width(cr, 2.2);
-            for (long i = f0; i <= f1; ++i) {
-                const double x = xT(an->frameTime((size_t)i)), y = mid - frameG(i) / rng * half;
-                if (i == f0) cairo_move_to(cr, x, y); else cairo_line_to(cr, x, y);
-            }
-            cairo_stroke(cr);
-            char b[24]; std::snprintf(b, sizeof b, "+%.0f dB", rng);
-            rgb(cr, kAmber, 0.8); text(cr, b, r.x + r.w - 6, mid - half - 2, 8, 1);
-            std::snprintf(b, sizeof b, "-%.0f dB", rng); text(cr, b, r.x + r.w - 6, mid + half + 9, 8, 1);
+            rgb(cr, kDim, 0.8); text(cr, "original", r.x + 30, r.y + 16, 9, -1);
+            rgb(cr, kAccent); text(cr, "levelled", r.x + 82, r.y + 16, 9, -1);
+            rgb(cr, kAmber); text(cr, "ride", r.x + 134, r.y + 16, 9, -1);
+            rgb(cr, kYellow, 0.8); text(cr, "scanning", r.x + 162, r.y + 16, 9, -1);
+        } else {
+            rgb(cr, kDim);
+            text(cr, running ? "Scanning..." : "Play the vocal track to scan it", r.x + r.w / 2, r.y + r.h / 2, 13, 0);
         }
-        // playhead
         const double px = xT(c0);
         rgb(cr, kText, havePos ? (running ? 0.9 : 0.45) : 0.15); cairo_set_line_width(cr, 1.5);
         cairo_move_to(cr, px, r.y); cairo_line_to(cr, px, r.y + r.h); cairo_stroke(cr);
-        char tb[32]; fmtTime(c0, tb, sizeof tb);
-        rgb(cr, kDim); text(cr, tb, px + 5, r.y + r.h - 6, 9, -1);
-        // legend
-        rgb(cr, kDim, 0.8); text(cr, "original", r.x + 30, r.y + 16, 9, -1);
-        rgb(cr, kAccent); text(cr, "levelled", r.x + 82, r.y + 16, 9, -1);
-        rgb(cr, kAmber); text(cr, "ride", r.x + 134, r.y + 16, 9, -1);
+        if (havePos) { char tb[32]; fmtTime(c0, tb, sizeof tb); rgb(cr, kDim); text(cr, tb, px + 5, r.y + r.h - 6, 9, -1); }
         cairo_restore(cr);
     }
 
@@ -642,9 +602,8 @@ private:
         const Rect r = kFaderWin;
         window(cr, r, 6);
         const double rng = std::max(1.0f, values[pRange]);
-        const bool live = running && align() == kAlignLocked && !bypassed();
-        const double g = live ? std::clamp((double)rideShown, -rng, rng) : 0.0;
-        // slot
+        const bool live = riding();
+        const double g = live || std::fabs(rideShown) > 0.05 ? std::clamp((double)rideShown, -rng, rng) : 0.0;
         const double sx = r.x + 62, sy0 = r.y + 22, sy1 = r.y + r.h - 22;
         auto yG = [&](double db) { return (sy0 + sy1) / 2 - db / rng * (sy1 - sy0) / 2; };
         cairo_set_source_rgb(cr, 0.01, 0.01, 0.02); rrect(cr, sx - 3, sy0, 6, sy1 - sy0, 3); cairo_fill(cr);
@@ -655,13 +614,11 @@ private:
             char b[16]; std::snprintf(b, sizeof b, i == 0 ? "0" : std::fabs(db - std::round(db)) > 0.05 ? "%+.1f" : "%+.0f", db);
             text(cr, b, sx - 30, y + 3, 8, 1);
         }
-        // ride bar from 0 to current
         if (std::fabs(g) > 0.05) {
             rgb(cr, kAmber, 0.85);
             const double y0 = yG(0), y1 = yG(g);
             cairo_rectangle(cr, sx - 2, std::min(y0, y1), 4, std::fabs(y1 - y0)); cairo_fill(cr);
         }
-        // fader cap
         const double cy = yG(g);
         cairo_set_source_rgba(cr, 0, 0, 0, 0.5); rrect(cr, sx - 17, cy - 9, 36, 20, 3); cairo_fill(cr);
         cairo_pattern_t* pg = cairo_pattern_create_linear(0, cy - 10, 0, cy + 10);
@@ -670,12 +627,14 @@ private:
         cairo_pattern_add_color_stop_rgb(pg, 1, 0.45, 0.46, 0.48);
         cairo_set_source(cr, pg); rrect(cr, sx - 18, cy - 10, 36, 20, 3); cairo_fill(cr); cairo_pattern_destroy(pg);
         rgb(cr, live ? kAmber : C{0.2, 0.2, 0.22}); cairo_rectangle(cr, sx - 15, cy - 1, 30, 2); cairo_fill(cr);
-        // readout
         char b[24];
         std::snprintf(b, sizeof b, "%+.1f", g);
         rgb(cr, live ? kText : kDim); text(cr, b, r.x + 160, r.y + r.h / 2 + 4, 26, 0);
         rgb(cr, kDim); text(cr, "dB RIDE", r.x + 160, r.y + r.h / 2 + 22, 9, 0);
-        const char* what = bypassed() ? "BYPASSED" : !an ? "NO TAKE" : align() != kAlignLocked ? "NOT SYNCED" : running ? (g > 0.3 ? "BOOSTING" : g < -0.3 ? "CUTTING" : "STEADY") : "STOPPED";
+        const int st = scanState();
+        const char* what = bypassed() ? "BYPASSED" : !hasScan() ? (running ? "SCANNING" : "NOT SCANNED")
+                         : live ? (g > 0.3 ? "BOOSTING" : g < -0.3 ? "CUTTING" : "STEADY")
+                         : running ? (st == kScanScanning ? "SCANNING" : "NOT RIDING") : "READY";
         rgb(cr, bypassed() ? kRed : kPrint); text(cr, what, r.x + 160, r.y + 40, 9, 0);
     }
 

@@ -13,7 +13,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,7 +26,7 @@ static constexpr double kHopSec = 0.010;   // analysis frame hop
 static constexpr double kWinSec = 0.040;   // analysis window
 
 // ----------------------------------------------------------------------------
-// WAV reading (PCM 8/16/24/32, float 32/64, WAVE_FORMAT_EXTENSIBLE, RF64, BWF)
+// WAV reading (used by the test tools; the plugin itself never opens files)
 // ----------------------------------------------------------------------------
 struct Audio {
     double sr = 0;
@@ -164,82 +167,42 @@ inline double percentile(std::vector<double> v, double p)
 }
 
 // ----------------------------------------------------------------------------
-// Analysis of a whole take (the slow part, done once per file version)
+// Scanned take, laid out on the timeline. Index i = 10 ms hop i of the timeline
+// (timeline sample i*hop). Frame i is the 40 ms window over hops i..i+3.
 // ----------------------------------------------------------------------------
+static constexpr double kFloorDb = -70.0;    // 10 ms level floor
+static constexpr double kSilentDb = -100.0;  // below this: no audio at all (empty timeline)
+
 struct Analysis {
     double sr = 0;
-    int hop = 0, win = 0;
-    double duration = 0;              // seconds
-    std::vector<double> lev;          // weighted level per frame (dB, 40 ms Hann)
-    std::vector<float> peak;          // peak |x| per hop (for the waveform display)
-    std::vector<float> alev;          // 10 ms rectangular level (dB) for alignment
-    std::vector<uint8_t> on;          // singing (incl. sibilants)
-    std::vector<uint8_t> levelOn;     // singing used for level estimate
-    bool hasTimeRef = false;
-    double timeRefSec = 0;
+    int hop = 0;
+    int64_t origin = 0;                  // timeline hop index of element 0
+    std::vector<double> lev;             // frame level (dB); -120 where not scanned
+    std::vector<float> peak;             // hop peak |x| (display)
+    std::vector<uint8_t> valid;          // frame scanned
+    std::vector<uint8_t> sib;            // frame is sibilant
+    std::vector<uint8_t> on;             // singing (incl. sibilants)
+    std::vector<uint8_t> levelOn;        // singing used for level estimate
+    std::vector<uint8_t> fresh;          // scanned during the playback in progress (not ridden yet)
     size_t frames() const { return lev.size(); }
-    // time (s) of frame i's centre
-    double frameTime(size_t i) const { return (i * (double)hop + win * 0.5) / sr; }
+    double frameTime(size_t i) const { return ((double)(origin + (int64_t)i) * hop + 2.0 * hop) / sr; }
+    double startTime() const { return (double)origin * hop / sr; }
+    double endTime() const { return ((double)(origin + (int64_t)lev.size()) + 3.0) * hop / sr; }
 };
 
-static constexpr double kAlignFloorDb = -70.0;
-
-inline void analyse(const Audio& a, Analysis& out)
+// singing detection over the scanned frames
+inline void detectSinging(Analysis& an)
 {
-    out = Analysis();
-    out.sr = a.sr;
-    out.hop = (int)(a.sr * kHopSec);
-    out.win = (int)(a.sr * kWinSec);
-    out.duration = a.mono.size() / a.sr;
-    out.hasTimeRef = a.hasTimeRef;
-    out.timeRefSec = a.timeRef / a.sr;
-    const size_t N = a.mono.size();
-    const int hop = out.hop, win = out.win;
-
-    Biquad hp; hp.highpass(90, M_SQRT1_2, a.sr);
-    Biquad s1, s2; s1.highpass(5000, 0.54119610, a.sr); s2.highpass(5000, 1.30656296, a.sr);
-    std::vector<float> xw(N), xh(N);
-    for (size_t i = 0; i < N; ++i) {
-        const double x = a.mono[i];
-        xw[i] = (float)hp.run(x);
-        xh[i] = (float)s2.run(s1.run(x));
-    }
-    const size_t n = N > (size_t)win ? (N - win) / hop + 1 : 1;
-    std::vector<double> w(win);
-    for (int i = 0; i < win; ++i) w[i] = 0.5 - 0.5 * std::cos(2 * M_PI * i / (win - 1));
-    out.lev.resize(n);
-    std::vector<double> sib(n);
-    for (size_t i = 0; i < n; ++i) {
-        double e = 0, eh = 0;
-        const size_t o = i * hop;
-        const int m = (int)std::min<size_t>(win, N - std::min(N, o));
-        for (int k = 0; k < m; ++k) {
-            const double a1 = xw[o + k] * w[k], a2 = xh[o + k] * w[k];
-            e += a1 * a1; eh += a2 * a2;
-        }
-        e = e / win + 1e-12; eh = eh / win + 1e-12;
-        out.lev[i] = 10 * std::log10(e);
-        sib[i] = eh / e;
-    }
-    const size_t nh = N / hop + 1;
-    out.peak.assign(nh, 0.f);
-    out.alev.assign(nh, (float)kAlignFloorDb);
-    for (size_t j = 0; j < nh; ++j) {
-        float pk = 0; double e = 0; size_t c = 0;
-        for (size_t k = j * hop; k < std::min(N, (j + 1) * hop); ++k, ++c) {
-            pk = std::max(pk, std::fabs(a.mono[k]));
-            e += (double)xw[k] * xw[k];
-        }
-        out.peak[j] = pk;
-        if (c) out.alev[j] = (float)std::max(kAlignFloorDb, 10 * std::log10(e / c + 1e-12));
-    }
-
-    // which frames are singing (not silence / breaths / sibilants)
-    const double top = percentile(out.lev, 95), floorEst = percentile(out.lev, 5);
+    const size_t n = an.frames();
+    std::vector<double> sc;
+    sc.reserve(n);
+    for (size_t i = 0; i < n; ++i) if (an.valid[i] && an.lev[i] > kSilentDb) sc.push_back(an.lev[i]);
+    an.on.assign(n, 0); an.levelOn.assign(n, 0);
+    if (sc.size() < 10) return;
+    const double top = percentile(sc, 95), floorEst = percentile(sc, 5);
     const double thr = std::max(top - 24.0, floorEst + 12.0);
     std::vector<uint8_t> raw(n);
-    for (size_t i = 0; i < n; ++i) raw[i] = out.lev[i] > thr;
-    out.on.resize(n);
+    for (size_t i = 0; i < n; ++i) raw[i] = an.valid[i] && an.lev[i] > thr;
     for (size_t i = 0; i < n; ++i) {   // 7-tap majority (scipy median_filter, mode reflect)
         int c = 0;
         for (int d = -3; d <= 3; ++d) {
@@ -248,14 +211,13 @@ inline void analyse(const Audio& a, Analysis& out)
             if (j >= (long)n) j = 2 * (long)n - j - 1;
             c += raw[(size_t)std::clamp<long>(j, 0, (long)n - 1)];
         }
-        out.on[i] = c >= 4;
+        an.on[i] = c >= 4 && an.valid[i];
+        an.levelOn[i] = an.on[i] && !an.sib[i];
     }
-    out.levelOn.resize(n);
-    for (size_t i = 0; i < n; ++i) out.levelOn[i] = out.on[i] && !(sib[i] > 0.6);
 }
 
 // ----------------------------------------------------------------------------
-// Gain curve (cheap: re-run whenever Strength / Range / Speed change)
+// Gain curve (cheap: re-run whenever the scan or Strength / Range / Speed change)
 // ----------------------------------------------------------------------------
 struct RideSettings {
     double strength = 0.85;   // 0..1
@@ -271,7 +233,7 @@ inline std::vector<float> gainCurve(const Analysis& an, const RideSettings& rs)
     for (size_t i = 0; i < n; ++i) if (an.levelOn[i]) act.push_back(i);
     if (act.size() < 5) return out;
 
-    const double sigma = std::max(1.0, rs.speed * 1000.0 / (kHopSec * 1000.0));
+    const double sigma = std::max(1.0, rs.speed / kHopSec);
     std::vector<double> en(n), msk(n);
     for (size_t i = 0; i < n; ++i) { msk[i] = an.levelOn[i]; en[i] = an.levelOn[i] ? std::pow(10.0, an.lev[i] / 10.0) : 0.0; }
     const std::vector<double> num = gaussSmooth(en, sigma), den = gaussSmooth(msk, sigma);
@@ -280,8 +242,7 @@ inline std::vector<float> gainCurve(const Analysis& an, const RideSettings& rs)
     for (size_t i = 0; i < n; ++i) {
         if (den[i] > 1e-4) { local[i] = 10 * std::log10(std::max(num[i], 1e-12) / std::max(den[i], 1e-4)); good.push_back(i); }
     }
-    // fill frames far from any singing with the nearest valid value
-    for (size_t gi = 0, i = 0; i < n; ++i) {
+    for (size_t gi = 0, i = 0; i < n; ++i) {   // far from any singing: nearest valid value
         if (den[i] > 1e-4) continue;
         while (gi + 1 < good.size() && good[gi + 1] < i) ++gi;
         if (i < good.front()) local[i] = local[good.front()];
@@ -312,203 +273,475 @@ inline std::vector<float> gainCurve(const Analysis& an, const RideSettings& rs)
     }
     // long silences (> ~1 s from singing): relax back to 0 dB
     for (size_t i = 0; i < n; ++i) g[i] *= std::clamp(1.0 - (dist[i] - 50.0) / 100.0, 0.0, 1.0);
-    g = gaussSmooth(g, std::max(1.0, 120.0 / (kHopSec * 1000.0)));
+    g = gaussSmooth(g, std::max(1.0, 0.120 / kHopSec));
     for (size_t i = 0; i < n; ++i) out[i] = (float)g[i];
     return out;
 }
 
-// gain (dB) at a time (s) in the take; 0 outside it
-inline float gainAt(const Analysis& an, const std::vector<float>& g, double t)
-{
-    if (g.empty() || t < 0 || t > an.duration) return 0.f;
-    const double f = (t * an.sr - an.win * 0.5) / an.hop;
-    if (f <= 0) return g.front();
-    const size_t i = (size_t)f;
-    if (i + 1 >= g.size()) return g.back();
-    const double fr = f - i;
-    return (float)(g[i] + (g[i + 1] - g[i]) * fr);
-}
-
-// ----------------------------------------------------------------------------
-// Alignment: where does the take sit on the DAW timeline?
-// The player records 10 ms input levels during playback; we slide them along the
-// take's own 10 ms levels and pick the best match (Pearson correlation).
-// ----------------------------------------------------------------------------
-struct AlignResult { bool ok = false; double offsetSec = 0; double score = 0; };
-
-// in: input levels (dB) for consecutive 10 ms hops starting at timeline time t0 (s)
-inline double alignScoreAt(const std::vector<float>& file, const float* in, int m, long d)
-{
-    double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0; int c = 0;
-    for (int k = 0; k < m; ++k) {
-        const long j = d + k;
-        const double y = (j >= 0 && j < (long)file.size()) ? file[(size_t)j] : kAlignFloorDb;
-        const double x = in[k];
-        sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; ++c;
-    }
-    const double vx = sxx - sx * sx / c, vy = syy - sy * sy / c;
-    if (vx < 1e-6 || vy < 1e-6) return 0;
-    return (sxy - sx * sy / c) / std::sqrt(vx * vy);
-}
-
-inline bool hasSinging(const float* in, int m)
-{
-    int loud = 0;
-    float mx = (float)kAlignFloorDb;
-    for (int k = 0; k < m; ++k) mx = std::max(mx, in[k]);
-    for (int k = 0; k < m; ++k) loud += in[k] > mx - 20 && in[k] > -60;
-    double s = 0, ss = 0;
-    for (int k = 0; k < m; ++k) { s += in[k]; ss += in[k] * in[k]; }
-    const double sd = std::sqrt(std::max(0.0, ss / m - (s / m) * (s / m)));
-    return loud >= 150 && sd > 4.0;   // at least ~1.5 s of singing
-}
-
-inline AlignResult alignSearch(const Analysis& an, const float* in, int m, double t0)
-{
-    AlignResult r;
-    if (m < 300 || !hasSinging(in, m)) return r;
-    const long nf = (long)an.alev.size();
-    std::vector<double> sc((size_t)(nf + m));
-    long best = 0; double bs = -2;
-    for (long d = -m + 1; d < nf; ++d) {
-        const double s = alignScoreAt(an.alev, in, m, d);
-        sc[(size_t)(d + m - 1)] = s;
-        if (s > bs) { bs = s; best = d; }
-    }
-    double second = -2;   // best score away from the winning peak
-    for (long d = -m + 1; d < nf; ++d)
-        if (std::labs(d - best) > 50) second = std::max(second, sc[(size_t)(d + m - 1)]);
-    r.score = bs;
-    // The plugin hears the very file it analysed, so the true position scores
-    // ~1.0; repeated choruses can still reach ~0.95, hence the tight bar.
-    r.ok = bs > 0.97 && bs - second > 0.02;
-    r.offsetSec = t0 - best * kHopSec;
-    return r;
-}
-
-// ----------------------------------------------------------------------------
-// Real-time player (audio thread side). The worker thread owns Analysis/curves
-// and publishes immutable Curve objects through an atomic pointer.
-// ----------------------------------------------------------------------------
+// What the player and the editor use: the analysis plus its ride curve.
 struct Curve {
-    double sr = 0, duration = 0;
-    int hop = 0, win = 0;
-    std::vector<float> g;
-    float at(double t) const
+    Analysis an;
+    std::vector<float> g;          // gain dB per frame
+    std::vector<uint8_t> ride;     // frame may be ridden (scanned, not fresh)
+    // gain (dB) at a timeline sample; ok = this spot may be ridden
+    float at(int64_t pos, bool& ok) const
     {
-        if (g.empty() || t < 0 || t > duration) return 0.f;
-        const double f = (t * sr - win * 0.5) / hop;
-        if (f <= 0) return g.front();
+        ok = false;
+        if (g.size() < 2) return 0.f;
+        const double f = (double)(pos - 2 * (int64_t)an.hop) / an.hop - (double)an.origin;
+        if (f < 0 || f >= (double)(g.size() - 1)) return 0.f;
         const size_t i = (size_t)f;
-        if (i + 1 >= g.size()) return g.back();
-        return (float)(g[i] + (g[i + 1] - g[i]) * (f - i));
+        ok = ride[i] && ride[i + 1];
+        return (float)(g[i] + (g[i + 1] - g[i]) * (f - (double)i));
     }
+    float atTime(double t) const { bool ok; return at((int64_t)std::llround(t * an.sr), ok); }
 };
 
-// lock-free ring of 10 ms input levels written by the audio thread
-struct LevelRing {
-    static constexpr int kSize = 4096;            // ~41 s
-    float lev[kSize];
-    double t[kSize];                              // timeline time (s) of each hop start
-    std::atomic<uint64_t> count{0};
-    std::atomic<uint64_t> epoch{0};               // bumps on every seek / discontinuity
-    void push(float l, double tt)
+inline std::shared_ptr<Curve> buildCurve(Analysis an, const RideSettings& rs)
+{
+    auto c = std::make_shared<Curve>();
+    detectSinging(an);
+    c->g = gainCurve(an, rs);
+    c->ride.resize(an.frames());
+    for (size_t i = 0; i < an.frames(); ++i) c->ride[i] = an.valid[i] && !an.fresh[i];
+    c->an = std::move(an);
+    return c;
+}
+
+// ----------------------------------------------------------------------------
+// TrackScanner: turns the audio heard during playback into scan data.
+// Runs on the worker thread (never the audio thread).
+// ----------------------------------------------------------------------------
+class TrackScanner {
+public:
+    static constexpr int kChunk = 1024;
+    enum : uint8_t { kHasHop = 1, kHasFrame = 2, kIsSib = 4 };
+
+    void init(double sampleRate)
     {
-        const uint64_t c = count.load(std::memory_order_relaxed);
-        lev[c % kSize] = l; t[c % kSize] = tt;
-        count.store(c + 1, std::memory_order_release);
+        if (sampleRate == sr) return;
+        sr = sampleRate;
+        hop = std::max(1, (int)(sr * kHopSec + 0.5));
+        win = 4 * hop;
+        hann.resize(win);
+        for (int i = 0; i < win; ++i) hann[i] = 0.5 - 0.5 * std::cos(2 * M_PI * i / (win - 1));
+        bw.assign(win, 0.f); bh.assign(win, 0.f); cw.assign(hop, 0.f); ch.assign(hop, 0.f);
+        clear();
     }
-    // copy the latest contiguous run (same epoch) of up to maxN hops
-    int latest(std::vector<float>& out, double& t0, int maxN, uint64_t sinceCount) const
+    int hopSize() const { return hop; }
+    double sampleRate() const { return sr; }
+
+    void clear() { store.clear(); endRun(); dirty = true; }
+
+    // contiguous timeline audio heard during playback (mono)
+    void feed(int64_t pos, const float* x, size_t n)
     {
-        const uint64_t c = count.load(std::memory_order_acquire);
-        uint64_t from = c > (uint64_t)maxN ? c - maxN : 0;
-        from = std::max(from, sinceCount);
-        if (c - from > (uint64_t)kSize - 64) from = c - (kSize - 64);
-        const int m = (int)(c - from);
-        out.resize(m);
-        for (int k = 0; k < m; ++k) out[k] = lev[(from + k) % kSize];
-        t0 = m ? t[from % kSize] : 0;
-        return m;
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t p = pos + (int64_t)i;
+            if (!runActive || p != expect) startRun();
+            expect = p + 1;
+            if (p < 0) continue;
+            if (curHop < 0) {
+                if (p % hop != 0) continue;
+                curHop = p / hop; fill = 0;
+            }
+            const double v = x[i];
+            const float xw = (float)hp.run(v), xh = (float)s2.run(s1.run(v));
+            cw[fill] = xw; ch[fill] = xh;
+            e10 += (double)xw * xw;
+            pk = std::max(pk, (float)std::fabs(v));
+            if (++fill == hop) completeHop();
+        }
     }
+
+    // transport stopped or jumped: what was scanned in this pass becomes rideable
+    void endRun()
+    {
+        if (runActive && freshInRun) dirty = true;
+        runActive = false; runId = 0; curHop = -1; freshInRun = 0;
+        holdFrom = holdTo = -1; urgentFlag = false;
+    }
+
+    bool running() const { return runActive; }
+    bool scanningFresh() const { return runActive && freshInRun > 0; }
+    // something changed that needs a new curve; newHops batches live scanning
+    bool needsRebuild() const { return dirty || newHops >= 50; }
+    // a change in the take was just detected: rebuild now so the player stops riding it
+    bool urgent() const { return urgentFlag; }
+
+    Analysis analysis()
+    {
+        dirty = false; newHops = 0; urgentFlag = false;
+        Analysis an;
+        an.sr = sr; an.hop = hop;
+        if (store.empty()) return an;
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (auto& kv : store) {
+            const Chunk& c = kv.second;
+            for (int k = 0; k < kChunk; ++k) if (c.flags[k] & kHasFrame) {
+                const int64_t idx = kv.first * kChunk + k;
+                lo = std::min(lo, idx); hi = std::max(hi, idx);
+            }
+        }
+        if (lo > hi) return an;
+        hi = std::min(hi, lo + (int64_t)(4 * 3600 / kHopSec));   // sanity cap: 4 hours
+        const size_t n = (size_t)(hi - lo + 1);
+        an.origin = lo;
+        an.lev.assign(n, -120.0); an.peak.assign(n, 0.f);
+        an.valid.assign(n, 0); an.sib.assign(n, 0); an.fresh.assign(n, 0);
+        for (auto& kv : store) {
+            const Chunk& c = kv.second;
+            for (int k = 0; k < kChunk; ++k) {
+                const int64_t idx = kv.first * kChunk + k - lo;
+                if (idx < 0 || idx >= (int64_t)n) continue;
+                if (c.flags[k] & kHasHop) an.peak[(size_t)idx] = c.peak[k];
+                if (c.flags[k] & kHasFrame) {
+                    an.valid[(size_t)idx] = 1;
+                    an.lev[(size_t)idx] = c.lev[k];
+                    an.sib[(size_t)idx] = (c.flags[k] & kIsSib) != 0;
+                    const int64_t ti = kv.first * kChunk + k;
+                    an.fresh[(size_t)idx] = runActive && (c.pass[k] == runId || (ti >= holdFrom && ti <= holdTo));
+                }
+            }
+        }
+        return an;
+    }
+
+    double scannedSeconds() const
+    {
+        size_t c = 0;
+        for (auto& kv : store) for (int k = 0; k < kChunk; ++k) c += (kv.second.flags[k] & kHasFrame) != 0;
+        return c * kHopSec;
+    }
+
+    // ---- session state (compact, base64) ----
+    std::string encode() const
+    {
+        std::string bin;
+        auto put = [&](const void* p, size_t n) { bin.append((const char*)p, n); };
+        int64_t runStart = -1; std::string run; uint32_t count = 0;
+        auto flush = [&] {
+            if (count) { put(&runStart, 8); put(&count, 4); bin += run; }
+            run.clear(); count = 0; runStart = -1;
+        };
+        int64_t prev = INT64_MIN;
+        for (auto& kv : store) {
+            const Chunk& c = kv.second;
+            for (int k = 0; k < kChunk; ++k) {
+                if (!(c.flags[k] & (kHasHop | kHasFrame))) continue;
+                const int64_t idx = kv.first * kChunk + k;
+                if (idx != prev + 1) flush();
+                if (runStart < 0) runStart = idx;
+                prev = idx;
+                const uint8_t fl = c.flags[k] & (kHasHop | kHasFrame | kIsSib);
+                const int16_t lv = (int16_t)std::clamp(std::lround(c.lev[k] * 100.0), -32000L, 32000L);
+                const int16_t al = (int16_t)std::clamp(std::lround(c.alev[k] * 100.0), -32000L, 32000L);
+                const uint8_t pq = (uint8_t)std::clamp(std::lround(std::sqrt(std::max(0.f, c.peak[k])) * 255.0), 0L, 255L);
+                run.push_back((char)fl); run.append((const char*)&lv, 2); run.append((const char*)&al, 2); run.push_back((char)pq);
+                ++count;
+            }
+        }
+        flush();
+        char hdr[64];
+        std::snprintf(hdr, sizeof hdr, "LB2 %d %d ", (int)std::lround(sr), hop);
+        return std::string(hdr) + base64(bin);
+    }
+
+    bool decode(const std::string& s)
+    {
+        // header "LB2 <rate> <hop> " (parsed by hand: sscanf would need a newer glibc)
+        if (s.compare(0, 4, "LB2 ") != 0) return false;
+        const char* c0 = s.c_str() + 4; char* e = nullptr;
+        const long srIn = std::strtol(c0, &e, 10);
+        if (e == c0) return false;
+        const char* c1 = e; const long hopIn = std::strtol(c1, &e, 10);
+        if (e == c1 || hopIn != hop || std::labs(srIn - std::lround(sr)) > 1) return false;
+        const std::string bin = unbase64(std::string(e));
+        std::map<int64_t, Chunk> st;
+        size_t p = 0;
+        while (p + 12 <= bin.size()) {
+            int64_t start; uint32_t count;
+            std::memcpy(&start, bin.data() + p, 8); std::memcpy(&count, bin.data() + p + 8, 4); p += 12;
+            if (p + (size_t)count * 6 > bin.size() || start < 0) return false;
+            for (uint32_t j = 0; j < count; ++j, p += 6) {
+                const int64_t idx = start + j;
+                Chunk& c = st[idx / kChunk];
+                const int k = (int)(idx % kChunk);
+                int16_t lv, al; std::memcpy(&lv, bin.data() + p + 1, 2); std::memcpy(&al, bin.data() + p + 3, 2);
+                const float pq = (uint8_t)bin[p + 5] / 255.f;
+                c.flags[k] = (uint8_t)bin[p];
+                c.lev[k] = lv / 100.f;
+                c.alev[k] = al / 100.f;
+                c.peak[k] = pq * pq;
+                c.pass[k] = 0;
+            }
+        }
+        store.swap(st);
+        endRun();
+        dirty = true;
+        return true;
+    }
+
+private:
+    struct Chunk {
+        float lev[kChunk], alev[kChunk], peak[kChunk];
+        uint8_t flags[kChunk];
+        uint32_t pass[kChunk];
+        Chunk()
+        {
+            std::fill(lev, lev + kChunk, -120.f); std::fill(alev, alev + kChunk, (float)kFloorDb); std::fill(peak, peak + kChunk, 0.f);
+            std::memset(flags, 0, sizeof flags); std::memset(pass, 0, sizeof pass);
+        }
+    };
+    Chunk& chunkAt(int64_t idx, int& k) { k = (int)(idx % kChunk); return store[idx / kChunk]; }
+
+    void startRun()
+    {
+        endRun();
+        runActive = true; runId = nextRunId++; if (nextRunId == 0) nextRunId = 1;
+        curHop = -1; fill = 0; runHops = 0; e10 = 0; pk = 0;
+        hp.highpass(90, M_SQRT1_2, sr);
+        s1.highpass(5000, 0.54119610, sr); s2.highpass(5000, 1.30656296, sr);
+        std::fill(bw.begin(), bw.end(), 0.f); std::fill(bh.begin(), bh.end(), 0.f);
+        chgHist.assign(30, 0); chgCount = 0; chgPos = 0;
+    }
+
+    void completeHop()
+    {
+        const int64_t h = curHop;
+        // slide the 4-hop window
+        std::memmove(bw.data(), bw.data() + hop, sizeof(float) * (win - hop));
+        std::memmove(bh.data(), bh.data() + hop, sizeof(float) * (win - hop));
+        std::memcpy(bw.data() + win - hop, cw.data(), sizeof(float) * hop);
+        std::memcpy(bh.data() + win - hop, ch.data(), sizeof(float) * hop);
+        ++runHops;
+        const float alev = (float)std::max(kFloorDb, 10 * std::log10(e10 / hop + 1e-12));
+        const bool warm = runHops > 10;   // filters settled after ~100 ms
+
+        int k; Chunk& c = chunkAt(h, k);
+        const bool had = c.flags[k] & kHasHop;
+        bool changed = false;
+        if (!had || warm) {
+            if (had) changed = std::fabs(c.alev[k] - alev) > 3.f && std::max(c.alev[k], alev) > -50.f;
+            c.alev[k] = alev; c.peak[k] = pk; c.flags[k] |= kHasHop;
+            if (!had) { c.pass[k] = runId; ++freshInRun; ++newHops; }
+        }
+        // sustained difference from the stored scan = the take was edited / replaced here
+        chgCount += (int)changed - chgHist[(size_t)chgPos];
+        chgHist[(size_t)chgPos] = changed; chgPos = (chgPos + 1) % 30;
+        if (chgCount >= 20) {
+            for (int64_t j = h - 29; j <= h; ++j) {
+                int kj; Chunk& cj = chunkAt(std::max<int64_t>(0, j), kj);
+                if (cj.pass[kj] != runId) { cj.pass[kj] = runId; ++freshInRun; }
+            }
+            // the rest of the edit lies just ahead and still holds the old scan:
+            // don't ride from here until 2 s after the changes stop
+            if (holdTo < h) { holdFrom = h - 29; urgentFlag = true; }
+            holdTo = h + 200;
+            dirty = true;
+        }
+
+        if (runHops >= 4 && h >= 3) {   // the 40 ms frame over hops h-3..h
+            const int64_t f = h - 3;
+            int kf; Chunk& cf = chunkAt(f, kf);
+            const bool hadF = cf.flags[kf] & kHasFrame;
+            if (!hadF || runHops > 13) {
+                double e = 0, eh = 0;
+                for (int j = 0; j < win; ++j) {
+                    const double a1 = bw[(size_t)j] * hann[(size_t)j], a2 = bh[(size_t)j] * hann[(size_t)j];
+                    e += a1 * a1; eh += a2 * a2;
+                }
+                e = e / win + 1e-12; eh = eh / win + 1e-12;
+                cf.lev[kf] = (float)(10 * std::log10(e));
+                cf.flags[kf] = (uint8_t)((cf.flags[kf] & ~kIsSib) | kHasFrame | (eh / e > 0.6 ? kIsSib : 0));
+            }
+        }
+        ++curHop; fill = 0; e10 = 0; pk = 0;
+    }
+
+    static std::string base64(const std::string& in)
+    {
+        static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string o; o.reserve((in.size() + 2) / 3 * 4);
+        size_t i = 0;
+        for (; i + 2 < in.size(); i += 3) {
+            const uint32_t v = ((uint8_t)in[i] << 16) | ((uint8_t)in[i + 1] << 8) | (uint8_t)in[i + 2];
+            o += t[v >> 18]; o += t[(v >> 12) & 63]; o += t[(v >> 6) & 63]; o += t[v & 63];
+        }
+        if (i < in.size()) {
+            uint32_t v = (uint8_t)in[i] << 16;
+            if (i + 1 < in.size()) v |= (uint8_t)in[i + 1] << 8;
+            o += t[v >> 18]; o += t[(v >> 12) & 63];
+            o += i + 1 < in.size() ? t[(v >> 6) & 63] : '=';
+            o += '=';
+        }
+        return o;
+    }
+    static std::string unbase64(const std::string& in)
+    {
+        auto val = [](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+') return 62;
+            if (c == '/') return 63;
+            return -1;
+        };
+        std::string o; uint32_t acc = 0; int bits = 0;
+        for (char c : in) {
+            const int v = val(c); if (v < 0) continue;
+            acc = (acc << 6) | (uint32_t)v; bits += 6;
+            if (bits >= 8) { bits -= 8; o += (char)((acc >> bits) & 0xFF); }
+        }
+        return o;
+    }
+
+    std::map<int64_t, Chunk> store;
+    double sr = 0;
+    int hop = 441, win = 1764;
+    std::vector<double> hann;
+    std::vector<float> bw, bh, cw, ch;
+    Biquad hp, s1, s2;
+    bool runActive = false, dirty = false;
+    uint32_t runId = 0, nextRunId = 1;
+    int64_t expect = 0, curHop = -1, holdFrom = -1, holdTo = -1;
+    bool urgentFlag = false;
+    int fill = 0, runHops = 0, chgCount = 0, chgPos = 0;
+    std::vector<uint8_t> chgHist = std::vector<uint8_t>(30, 0);
+    double e10 = 0;
+    float pk = 0;
+    size_t freshInRun = 0, newHops = 0;
 };
 
+// whole file as if played once from timeline 0 (tests / offline tools)
+inline Analysis analyseAudio(const Audio& a, int64_t timelineOffset = 0)
+{
+    TrackScanner s; s.init(a.sr);
+    s.feed(timelineOffset, a.mono.data(), a.mono.size());
+    s.endRun();
+    return s.analysis();
+}
+
+// ----------------------------------------------------------------------------
+// Audio thread -> worker: lock-free single-producer/single-consumer sample FIFO
+// ----------------------------------------------------------------------------
+class SampleFifo {
+public:
+    static constexpr uint64_t kN = 1u << 21, kRec = 8192;   // ~44 s of mono audio at 48 kHz
+    SampleFifo() : buf(kN), rec(kRec) {}
+
+    bool push(int64_t pos, const float* x, uint32_t n)   // audio thread
+    {
+        const uint64_t ws = wSamp.load(std::memory_order_relaxed), wr = wRec.load(std::memory_order_relaxed);
+        if (wr - rRec.load(std::memory_order_acquire) >= kRec || ws + n - rSamp.load(std::memory_order_acquire) > kN) {
+            overflow.store(true, std::memory_order_relaxed);
+            return false;
+        }
+        for (uint32_t i = 0; i < n; ++i) buf[(ws + i) % kN] = x[i];
+        rec[wr % kRec] = { pos, n, ws };
+        wSamp.store(ws + n, std::memory_order_release);
+        wRec.store(wr + 1, std::memory_order_release);
+        return true;
+    }
+
+    // worker: f(pos, samples, n) for each pushed block, in order
+    template <class F> size_t drain(F&& f)
+    {
+        const uint64_t wr = wRec.load(std::memory_order_acquire);
+        uint64_t rr = rRec.load(std::memory_order_relaxed);
+        size_t total = 0;
+        for (; rr < wr; ++rr) {
+            const Rec r = rec[rr % kRec];
+            const uint64_t a = r.start % kN;
+            if (a + r.n <= kN) f(r.pos, &buf[a], (size_t)r.n);
+            else {
+                const size_t first = (size_t)(kN - a);
+                f(r.pos, &buf[a], first);
+                f(r.pos + (int64_t)first, &buf[0], (size_t)r.n - first);
+            }
+            total += r.n;
+            rSamp.store(r.start + r.n, std::memory_order_release);
+            rRec.store(rr + 1, std::memory_order_release);
+        }
+        return total;
+    }
+    bool takeOverflow() { return overflow.exchange(false); }
+
+private:
+    struct Rec { int64_t pos; uint32_t n; uint64_t start; };
+    std::vector<float> buf;
+    std::vector<Rec> rec;
+    std::atomic<uint64_t> wSamp{0}, rSamp{0}, wRec{0}, rRec{0};
+    std::atomic<bool> overflow{false};
+};
+
+// ----------------------------------------------------------------------------
+// Real-time player (audio thread). The worker publishes immutable Curves.
+// ----------------------------------------------------------------------------
 class Player {
 public:
-    // set by the host wrapper
     std::atomic<const Curve*> curve{nullptr};
-    std::atomic<bool> aligned{false};
-    std::atomic<double> offsetSec{0};             // timeline time (s) where the take starts
     std::atomic<bool> bypass{false};
     std::atomic<float> outGainDb{0};
-    LevelRing ring;
+    SampleFifo fifo;
 
     // meters (read by the wrapper after process)
     float meterGain = 0, meterPos = -1, meterIn = -90, meterOut = -90;
+    bool meterRiding = false;
 
     void init(double sampleRate)
     {
         sr = sampleRate;
-        hopN = std::max(1, (int)std::lround(sr * kHopSec));
         smooth = 1.0 - std::exp(-1.0 / (0.004 * sr));
-        fadeStep = 1.0 / (0.3 * sr);   // ride fades in/out over 300 ms (alignment, bypass)
-        rideMix = 0;
-        hp.highpass(90, M_SQRT1_2, sr);
-        g = 1; hopAcc = 0; hopE = 0; hopPos = -1; lastEnd = -1;
+        fadeStep = 1.0 / (0.3 * sr);   // ride fades in/out over 300 ms
+        g = 1; rideMix = 0;
     }
 
-    // timelineFrame: host transport position of the first sample (only valid if playing)
-    void process(const float* const* in, float* const* out, int nch, uint32_t frames, bool playing, int64_t timelineFrame)
+    // pos: host timeline position of the first sample (only meaningful when playing)
+    void process(const float* const* in, float* const* out, int nch, uint32_t frames, bool playing, int64_t pos)
     {
         const Curve* c = curve.load(std::memory_order_acquire);
-        const bool ride = playing && c && aligned.load(std::memory_order_relaxed) && !bypass.load(std::memory_order_relaxed);
-        const double off = offsetSec.load(std::memory_order_relaxed);
+        const bool byp = bypass.load(std::memory_order_relaxed);
         const double trim = std::pow(10.0, outGainDb.load(std::memory_order_relaxed) / 20.0);
-
-        if (!playing || timelineFrame != lastEnd) { hopAcc = 0; hopE = 0; hopPos = -1; ring.epoch.fetch_add(1); }
-        lastEnd = playing ? timelineFrame + frames : -1;
-
         double pin = 0, pout = 0;
-        float gdb = 0;
+        bool anyRide = false;
         for (uint32_t i = 0; i < frames; ++i) {
-            double target = 1.0;
-            rideMix = ride ? std::min(1.0, rideMix + fadeStep) : std::max(0.0, rideMix - fadeStep);
-            if (rideMix > 0 && c && playing) {
-                const double t = (timelineFrame + (int64_t)i) / sr - off;
-                gdb = c->at(t) * (float)rideMix;
-                target = std::pow(10.0, gdb / 20.0);
-            }
+            bool ok = false;
+            float gd = 0;
+            if (playing && c && !byp) gd = c->at(pos + (int64_t)i, ok);
+            rideMix = ok ? std::min(1.0, rideMix + fadeStep) : std::max(0.0, rideMix - fadeStep);
+            const double target = rideMix > 0 ? std::pow(10.0, gd * rideMix / 20.0) : 1.0;
             g += (target - g) * smooth;
-            double mono = 0;
+            anyRide |= ok;
+            double m = 0;
             for (int ch = 0; ch < nch; ++ch) {
                 const double x = in[ch][i];
-                mono += x;
+                m += x;
                 const double y = x * g * trim;
                 out[ch][i] = (float)y;
                 pin = std::max(pin, std::fabs(x)); pout = std::max(pout, std::fabs(y));
             }
-            if (playing) {   // 10 ms level history for alignment, hops locked to the timeline grid
-                const int64_t pos = timelineFrame + i;
-                if (hopPos < 0) { if (pos % hopN != 0) continue; hopPos = pos; }
-                const double w = hp.run(mono / nch);
-                hopE += w * w;
-                if (++hopAcc == hopN) {
-                    ring.push((float)std::max(kAlignFloorDb, 10 * std::log10(hopE / hopN + 1e-12)), hopPos / sr);
-                    hopPos += hopN; hopAcc = 0; hopE = 0;
-                }
-            }
+            mono[monoN++] = (float)(m / nch);
+            if (monoN == kMono) flushMono(playing, pos + (int64_t)i + 1);
         }
+        flushMono(playing, pos + (int64_t)frames);
         meterGain = (float)(20 * std::log10(std::max(g, 1e-6)));
-        meterPos = (playing && c) ? (float)(timelineFrame / sr - off) : -1.f;
+        meterPos = playing ? (float)(pos / sr) : -1.f;
         meterIn = (float)(20 * std::log10(pin + 1e-9));
         meterOut = (float)(20 * std::log10(pout + 1e-9));
+        meterRiding = anyRide;
     }
 
 private:
-    double sr = 48000, smooth = 0.01, g = 1, hopE = 0, rideMix = 0, fadeStep = 1e-4;
-    int hopN = 480, hopAcc = 0;
-    int64_t hopPos = -1, lastEnd = -1;
-    Biquad hp;
+    static constexpr int kMono = 4096;
+    void flushMono(bool playing, int64_t endPos)
+    {
+        if (monoN && playing) fifo.push(endPos - monoN, mono, (uint32_t)monoN);
+        monoN = 0;
+    }
+    float mono[kMono];
+    int monoN = 0;
+    double sr = 48000, smooth = 0.01, g = 1, rideMix = 0, fadeStep = 1e-4;
 };
 
 } // namespace levelbrew
