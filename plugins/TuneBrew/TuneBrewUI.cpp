@@ -1,4 +1,5 @@
 #include "DistrhoUI.hpp"
+#include "TuneBrewPlugin.hpp"
 #include "../../src/TuneView.hpp"
 #include <chrono>
 
@@ -14,6 +15,11 @@ public:
           view(this),
           t0(std::chrono::steady_clock::now())
     {
+        // the editor reads the pitch scan and marked phrases straight from the plugin
+        if (TuneBrewPlugin* const p = static_cast<TuneBrewPlugin*>(static_cast<Plugin*>(getPluginInstancePointer()))) {
+            view.setEngine(p->enginePtr());
+            view.setRegions(p->enginePtr()->regions());
+        }
     }
 
 protected:
@@ -24,16 +30,26 @@ protected:
         if (index < tunebrew::pOutPitch) repaint();
     }
 
+    void stateChanged(const char* key, const char* value) override
+    {
+        if (std::strcmp(key, "regions") == 0) {
+            tunebrew::RegionSet rs; rs.decode(value);
+            view.setRegions(rs);
+            repaint();
+        }
+    }
+
     void uiIdle() override
     {
-        view.tick(now());
-        repaint();
+        // redraw only when something on screen actually changed
+        if (view.tick(now())) repaint();
     }
 
     // ---- editor -> host ----
     void setParam(int index, float value) override { setParameterValue((uint32_t)index, value); repaint(); }
     void beginEdit(int index) override { editParameter((uint32_t)index, true); }
     void endEdit(int index) override { editParameter((uint32_t)index, false); }
+    void regionsChanged(const tunebrew::RegionSet& rs) override { setState("regions", rs.encode().c_str()); }
 
     // ---- drawing & input ----
     void onCairoDisplay(const CairoGraphicsContext& context) override

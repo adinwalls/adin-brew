@@ -10,5 +10,5 @@ include ../../dpf/Makefile.plugins.mk
 # portable binaries: don't depend on the host's libstdc++ version
 LINK_FLAGS += -static-libstdc++ -static-libgcc
 BUILD_CXX_FLAGS += -std=gnu++17
-TARGETS += lv2_sep vst2 vst3 clap
+TARGETS += lv2 vst2 vst3 clap
 all: $(TARGETS)

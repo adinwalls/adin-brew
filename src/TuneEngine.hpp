@@ -11,6 +11,7 @@
 #include <vector>
 #include <algorithm>
 #include "KeyDetect.hpp"
+#include "PhrasePull.hpp"
 
 namespace tunebrew {
 
@@ -63,6 +64,30 @@ public:
     volatile float meterKeyAlt = -1.f;  // runner-up key with a different note set
     volatile float meterTuneOff = 0.f;  // tuning offset vs A440 (cents)
     volatile float meterLearnSecs = 0.f;
+    volatile float meterPull = 0.f;     // phrase pull applied right now (0..1)
+    volatile double meterPos = -1.0;    // song position in seconds, -1 if the host gives none
+    volatile bool meterPlaying = false;
+
+    // ---- phrase pull ----
+    PitchScan scan;                     // pitch along the song timeline, learned during playback
+
+    // any thread except the audio thread
+    void setRegions(const RegionSet& rs)
+    {
+        const int next = 1 - regionIdx.load();
+        regionBuf[next] = rs;
+        regionIdx.store(next);
+    }
+    const RegionSet& regions() const { return regionBuf[regionIdx.load()]; }
+
+    // audio thread, before each process(): where this block sits on the song timeline
+    void setTimeline(bool known, bool playing, double frame)
+    {
+        tlValid = known && playing;
+        tlOff = frame - (double)t;
+        meterPlaying = tlValid;
+        meterPos = known ? frame / sr : -1.0;
+    }
 
     void init(double sampleRate, int channels)
     {
@@ -90,8 +115,9 @@ public:
         dHop = std::max(32, (int)std::round(dsr * 0.005)); // ~5 ms
         dRingSize = 1; while (dRingSize < 4 * (dWin + dTmax)) dRingSize <<= 1;
         dRing.assign(dRingSize, 0.f);
-        diff.assign(dTmax + 2, 0.f);
         cmnd.assign(dTmax + 2, 0.f);
+        lin.assign(dWin + dTmax + 16, 0.f);
+        mk.assign((int)(2.5 * tMax) + 64, 0.f);
         // 2x one-pole low-pass ~ 1 kHz (keeps fundamental, kills formant octave traps)
         lpA = (float)std::exp(-2.0 * M_PI * 1000.0 / sr);
         // RMS follower ~ 30 ms
@@ -121,6 +147,7 @@ public:
         lastTarget = -1000; stableTime = 0.0; lastStable440 = 0.0;
         learnPrev = false; keyEvalCount = 0;
         keys.reset();
+        tlValid = false; meterPull = 0.f;
     }
 
     int getLatency() const { return latency; }
@@ -182,30 +209,49 @@ private:
         const int N = dWin + dTmax;
         const int64_t base = dt - N;
         const int m = dRingSize - 1;
-        auto X = [&](int j) { return dRing[(base + j) & m]; };
-
-        // YIN difference function
-        for (int tau = 1; tau <= dTmax; ++tau) {
-            float s = 0.f;
-            for (int j = 0; j < dWin; ++j) { const float d = X(j) - X(j + tau); s += d * d; }
-            diff[tau] = s;
-        }
-        cmnd[0] = 1.f;
-        double run = 0.0;
-        for (int tau = 1; tau <= dTmax; ++tau) {
-            run += diff[tau];
-            cmnd[tau] = run > 0.0 ? (float)(diff[tau] * tau / run) : 1.f;
-        }
-        const float thresh = 0.18f;
+        // YIN, cheaply:
+        //   * silence costs nothing (no pitch search below the gate level)
+        //   * the window is copied out of the ring so the inner loop is a plain
+        //     array difference the compiler can vectorise
+        //   * lags are evaluated only as far as the first clear dip, so higher
+        //     notes cost a fraction of a full search
+        const float levelDb = 10.f * std::log10(ms + 1e-12f);
         int best = -1;
-        for (int tau = dTmin; tau < dTmax; ++tau) {
-            if (cmnd[tau] < thresh) {
-                while (tau + 1 < dTmax && cmnd[tau + 1] < cmnd[tau]) ++tau;
-                best = tau; break;
+        if (levelDb > -55.f) {
+            float* const x = lin.data();
+            const int start = (int)(base & m);
+            const int first = std::min(N, dRingSize - start);
+            std::memcpy(x, &dRing[start], (size_t)first * sizeof(float));
+            if (first < N) std::memcpy(x + first, &dRing[0], (size_t)(N - first) * sizeof(float));
+            cmnd[0] = 1.f;
+            double run = 0.0;
+            int done = 0;
+            const int win = dWin;
+            auto ensure = [&](int upTo) {
+                for (int tau = done + 1; tau <= upTo; ++tau) {
+                    const float* const y = x + tau;
+                    float sum = 0.f;
+                    for (int j = 0; j < win; ++j) { const float d = x[j] - y[j]; sum += d * d; }
+                    run += sum;
+                    cmnd[tau] = run > 0.0 ? (float)(sum * tau / run) : 1.f;
+                }
+                if (upTo > done) done = upTo;
+            };
+            const float thresh = 0.18f;
+            for (int tau = dTmin; tau < dTmax; ++tau) {
+                ensure(tau);
+                if (cmnd[tau] < thresh) {
+                    while (tau + 1 < dTmax) {
+                        ensure(tau + 1);
+                        if (cmnd[tau + 1] < cmnd[tau]) ++tau; else break;
+                    }
+                    best = tau;
+                    ensure(best + 1);
+                    break;
+                }
             }
         }
-        const float levelDb = 10.f * std::log10(ms + 1e-12f);
-        bool voiced = best > 0 && levelDb > -55.f;
+        bool voiced = best > 0;
 
         double period = 0.0;
         if (voiced) {
@@ -231,6 +277,22 @@ private:
         if (learn && !learnPrev) keys.reset();
         learnPrev = learn;
 
+        // ---- phrase pull: is this moment inside a phrase the user marked? ----
+        const double tl = tlValid ? ((double)t - 0.5 * N * dec + tlOff) / sr : -1.0;
+        double pull = 0.0; int noteShift = 0;
+        if (tl >= 0.0) {
+            const RegionSet& rs = regionBuf[regionIdx.load(std::memory_order_relaxed)];
+            const int ri = rs.find(tl);
+            if (ri >= 0) {
+                const PullRegion& rg = rs.r[ri];
+                pull = rg.pull * smoothstep(0.0, 0.02, std::min(tl - rg.start, rg.end - tl));
+                noteShift = rg.shift;
+            }
+        }
+        meterPull = (float)pull;
+        const double keep = 1.0 - pull;             // how much of the "natural" behaviour stays
+        double scanIn = 0.0, scanOut = 0.0;
+
         if (voiced) {
             const double f = sr / period;
             const double midi = 69.0 + 12.0 * std::log2(f / refHz);
@@ -254,31 +316,34 @@ private:
             meterVib = vibOn ? (float)(depth * 100.0) : 0.f;
 
             // ---- target and note timing ----
-            const int target = pickTarget(centerEff);
+            int target = pickTarget(centerEff);
+            if (noteShift != 0 && target > -1000) target = stepNote(target, noteShift);
             const double spd = std::fabs(centerEff - lastCenterEff) / hopSec;   // semitones / s
             lastCenterEff = centerEff;
             speedSm += (1.0 - std::exp(-hopSec / 0.02)) * (spd - speedSm);
             if (target != lastTarget) { noteTime = 0.0; lastTarget = target; }
             else noteTime += hopSec;
-            const double trSec = transitionMs * 0.001;
+            const double trSec = transitionMs * 0.001 * keep;
+            const double flexE = flex * keep, humE = humanize * keep;
+            const double amtE = amount + (1.0 - amount) * pull;
             if (natural && trSec > 0.0 && speedSm > 8.0) noteTime = 0.0;   // sliding: treat as transition
 
             // ---- weights ----
             double w = 1.0;
             if (natural && target > -1000) {
-                if (flex > 0.0) {
-                    const double dFull = 0.5 - 0.35 * flex;                     // semitones
+                if (flexE > 0.0 && noteShift == 0) {
+                    const double dFull = 0.5 - 0.35 * flexE;                     // semitones
                     w *= 1.0 - smoothstep(dFull, dFull + 0.15, std::fabs(centerEff - target));
                 }
                 if (trSec > 0.0) w *= smoothstep(0.0, trSec, noteTime);
             }
-            const double corr = (target > -1000) ? (target - centerEff) * amount * w : 0.0;
+            const double corr = (target > -1000) ? (target - centerEff) * amtE * w : 0.0;
 
             // ---- retune speed (humanize slows it on sustained notes) ----
-            double rt = retuneMs;
+            double rt = retuneMs * keep;
             if (natural) {
-                rt += humanize * 400.0 * smoothstep(0.12, 0.5, noteTime);
-                if (trSec > 0.0) rt = std::max(rt, 0.25 * transitionMs);
+                rt += humE * 400.0 * smoothstep(0.12, 0.5, noteTime);
+                if (trSec > 0.0) rt = std::max(rt, 0.25 * transitionMs * keep);
             }
             if (!wasVoicedDet) corrSmooth = (rt <= 0.5) ? corr : 0.0;
             const double alpha = rt <= 0.5 ? 1.0 : 1.0 - std::exp(-hopSec / (rt * 0.001));
@@ -290,6 +355,7 @@ private:
             meterHz = (float)f;
             meterTarget = (float)target;
             meterCents = (float)(shift * 100.0);
+            scanIn = midi; scanOut = midi + shift;
 
             // ---- key learning: count held, steady notes ----
             if (learn) {
@@ -307,6 +373,7 @@ private:
             curTarget = -1000;
         }
         wasVoicedDet = voiced;
+        if (tl >= 0.0) scan.write(tl, scanIn, scanOut);
 
         if (learn && ++keyEvalCount >= 20) {
             keyEvalCount = 0;
@@ -388,6 +455,18 @@ private:
         return ((masks[sc] >> rel) & 1) && ((noteMask >> pc) & 1);
     }
 
+    // move a note up or down the scale by whole scale steps
+    int stepNote(int n, int steps) const
+    {
+        const int dir = steps > 0 ? 1 : -1;
+        for (int k = 0; k < std::abs(steps); ++k) {
+            int mm = n;
+            for (int g = 0; g < 12; ++g) { mm += dir; if (allowed(mm)) break; }
+            n = mm;
+        }
+        return n;
+    }
+
     int pickTarget(double midi)
     {
         // hysteresis: stick with the current note unless we're clearly nearer another
@@ -433,21 +512,6 @@ private:
         return false;
     }
 
-    inline float readIn(int c, double pos) const
-    {
-        const double fl = std::floor(pos);
-        const int64_t i = (int64_t)fl;
-        const float f = (float)(pos - fl);
-        const std::vector<float>& x = xin[c];
-        const float y1 = x[i & ringMask];
-        if (f == 0.f) return y1;
-        const float y0 = x[(i - 1) & ringMask], y2 = x[(i + 1) & ringMask], y3 = x[(i + 2) & ringMask];
-        const float c1 = 0.5f * (y2 - y0);
-        const float c2 = y0 - 2.5f * y1 + 2.f * y2 - 0.5f * y3;
-        const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
-        return ((c3 * f + c2) * f + c1) * f + y1;
-    }
-
     // Find the next pitch mark one period after `a` by waveform similarity:
     // the candidate whose surrounding cycle best matches the cycle around `a`.
     // Marks found this way are spaced by the true local period, so with no
@@ -458,24 +522,32 @@ private:
         const int half = L / 2;
         const int ai = (int)std::lround(a);
         const int lo = (int)std::floor(a + 0.85 * T), hi = (int)std::ceil(a + 1.15 * T);
-        double ea = 0.0;
-        for (int k = -half; k < half; ++k) { const double v = pk[(ai + k) & ringMask]; ea += v * v; }
+        // copy the stretch of signal we compare into a plain array (vectorises)
+        const int w0 = ai - half, total = hi + half - w0, n2 = 2 * half;
+        if (total > (int)mk.size()) return a + T;
+        float* const A = mk.data();
+        {
+            const int st = w0 & ringMask;
+            const int first = std::min(total, ringSize - st);
+            std::memcpy(A, &pk[st], (size_t)first * sizeof(float));
+            if (first < total) std::memcpy(A + first, &pk[0], (size_t)(total - first) * sizeof(float));
+        }
+        float eaf = 0.f;
+        for (int k = 0; k < n2; ++k) eaf += A[k] * A[k];
+        const double ea = eaf;
         if (ea < 1e-12) return a + T;
         double best = -2.0; int bi = (int)std::lround(a + T);
-        double sc[3] = { 0, 0, 0 }; double prev = -2.0, prev2 = -2.0;
+        double sc[3] = { 0, 0, 0 }; double prev = -2.0;
         bool haveParab = false;
         for (int c = lo; c <= hi; ++c) {
-            double xy = 0.0, ec = 0.0;
-            for (int k = -half; k < half; ++k) {
-                const double u = pk[(ai + k) & ringMask], v = pk[(c + k) & ringMask];
-                xy += u * v; ec += v * v;
-            }
-            const double r = xy / std::sqrt(ea * ec + 1e-20);
+            const float* const B = A + (c - ai);
+            float xy = 0.f, ec = 0.f;
+            for (int k = 0; k < n2; ++k) { xy += A[k] * B[k]; ec += B[k] * B[k]; }
+            const double r = xy / std::sqrt(ea * (double)ec + 1e-20);
             if (r > best) { best = r; bi = c; sc[0] = prev; sc[1] = r; haveParab = false; }
             else if (c == bi + 1) { sc[2] = r; haveParab = true; }
-            prev2 = prev; prev = r;
+            prev = r;
         }
-        (void)prev2;
         if (best < 0.3 || bi <= lo || bi >= hi) return a + T;   // no convincing match: keep the period
         double off = 0.0;
         if (haveParab) {
@@ -534,13 +606,32 @@ private:
         if (s - half >= 0.0) {
             const int j0 = (int)std::ceil(s - half), j1 = (int)std::floor(s + half);
             const double inv = 1.0 / half;
+            // Hann window by rotation instead of a cosine per sample
+            const double th0 = M_PI * (j0 - s) * inv, dth = M_PI * inv;
+            double cw = std::cos(th0), sw = std::sin(th0);
+            const double cd = std::cos(dth), sd = std::sin(dth);
+            // every sample of the grain reads the input at the same sub-sample
+            // offset, so the interpolation weights are worked out once
+            const double off = a - s, ofl = std::floor(off);
+            const int64_t io = (int64_t)ofl;
+            const float f = (float)(off - ofl);
+            const float f2 = f * f, f3 = f2 * f;
+            const float k0 = -0.5f * f + f2 - 0.5f * f3, k1 = 1.f - 2.5f * f2 + 1.5f * f3;
+            const float k2 = 0.5f * f + 2.f * f2 - 1.5f * f3, k3 = -0.5f * f2 + 0.5f * f3;
+            const bool whole = f == 0.f;
             for (int j = j0; j <= j1; ++j) {
-                const double w = 0.5 * (1.0 + std::cos(M_PI * (j - s) * inv));
+                const double w = 0.5 * (1.0 + cw);
+                const double cn = cw * cd - sw * sd; sw = sw * cd + cw * sd; cw = cn;
                 if (w <= 0.0) continue;
                 const float wgt = (float)w;
                 const int ji = j & ringMask;
-                const double src = a + (j - s);
-                for (int c = 0; c < nch; ++c) yout[c][ji] += wgt * readIn(c, src);
+                const int64_t i = j + io;
+                for (int c = 0; c < nch; ++c) {
+                    const float* const x = xin[c].data();
+                    const float v = whole ? x[i & ringMask]
+                        : k0 * x[(i - 1) & ringMask] + k1 * x[i & ringMask] + k2 * x[(i + 1) & ringMask] + k3 * x[(i + 2) & ringMask];
+                    yout[c][ji] += wgt * v;
+                }
                 wsum[ji] += wgt;
             }
         }
@@ -558,7 +649,8 @@ private:
     bool lastVoiced = false;
 
     int dec = 2, dTmax = 0, dTmin = 0, dWin = 0, dHop = 0, dRingSize = 0;
-    std::vector<float> dRing, diff, cmnd;
+    std::vector<float> dRing, cmnd, lin;
+    mutable std::vector<float> mk;      // scratch for nextMark
     int64_t dt = 0;
     int decCount = 0, hopCount = 0;
     float decAcc = 0.f, lpA = 0.f, lp1 = 0.f, lp2 = 0.f, rmsA = 0.f, ms = 0.f;
@@ -575,6 +667,11 @@ private:
     double stableTime = 0.0, lastStable440 = 0.0;
     bool wasVoicedDet = false;
     int curTarget = -1000;
+    // phrase pull state
+    RegionSet regionBuf[2];
+    std::atomic<int> regionIdx{0};
+    bool tlValid = false;
+    double tlOff = 0.0;
 };
 
 } // namespace tunebrew

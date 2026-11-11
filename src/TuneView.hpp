@@ -25,6 +25,7 @@ public:
         virtual void setParam(int index, float value) = 0;
         virtual void beginEdit(int index) = 0;
         virtual void endEdit(int index) = 0;
+        virtual void regionsChanged(const RegionSet&) {}   // phrase pull edits
         virtual ~Host() {}
     };
 
@@ -33,13 +34,25 @@ public:
         for (int i = 0; i < pCount; ++i) values[i] = kSpecs[i].def;
         hist.resize(kHistSize);
     }
+    ~TuneView() { if (bg) cairo_surface_destroy(bg); if (ctl) cairo_surface_destroy(ctl); }
+    TuneView(const TuneView&) = delete;
+    TuneView& operator=(const TuneView&) = delete;
+
+    // phrase pull: the engine supplies the pitch scan and song position
+    void setEngine(const TuneEngine* e) { eng = e; dirty = true; }
+    void setRegions(const RegionSet& r) { if (gdrag == dNone) { regs = r; if (sel >= regs.n) sel = -1; dirty = true; } }
+    const RegionSet& getRegions() const { return regs; }
+    double getViewStart() const { return viewStart; }
+    void setPhraseMode(bool on) { phraseMode = on; dirty = true; }
+    void select(int i) { sel = (i >= 0 && i < regs.n) ? i : -1; dirty = true; }
 
     // ---------------- inputs ----------------
-    void setValue(int i, float v) { if (i >= 0 && i < pCount) values[i] = v; }
+    void setValue(int i, float v) { if (i >= 0 && i < pCount && values[i] != v) { values[i] = v; dirty = true; } }
     float getValue(int i) const { return values[i]; }
 
     // call at UI refresh rate with a monotonically increasing time in seconds
-    void tick(double now)
+    // returns true when the picture changed and should be redrawn
+    bool tick(double now)
     {
         nowT = now;
         if (values[pOutActivity] != lastActivity) { lastActivity = values[pOutActivity]; lastActivityT = now; }
@@ -68,28 +81,87 @@ public:
             const float want = sum / n;
             if (std::fabs(want - center) > 3.5f) center += (want - center) * 0.08f;
         }
+        if (s.voiced) lastVoicedT = now;
+
+        // phrase view: follow the song position
+        bool moved = false;
+        if (eng) {
+            const double pos = eng->meterPos;
+            const bool playing = eng->meterPlaying && running;
+            if (gdrag == dNone && pos >= 0.0 && (playing || std::fabs(pos - lastPos) > 0.05)) {
+                const double want = std::max(0.0, pos - 0.5 * kViewLen);
+                if (playing || pos < viewStart || pos > viewStart + kViewLen) viewStart = want;
+            }
+            if (pos != lastPos) { lastPos = pos; moved = true; }
+            const uint32_t v = eng->scan.version.load(std::memory_order_relaxed);
+            if (v != seenScan) { seenScan = v; moved = true; }
+        }
+        if (confirmClear && now - confirmT > 2.5) { confirmClear = false; dirty = true; }
+
+        const bool need = dirty || running || learning() || now - lastVoicedT < kWindow + 0.5
+                          || (phraseMode && moved);
+        dirty = false;
+        // at most ~30 pictures a second
+        if (need) pending = true;
+        if (pending && now - lastFrameT >= 0.03) { pending = false; lastFrameT = now; return true; }
+        return false;
     }
 
     // ---------------- drawing ----------------
     void draw(cairo_t* cr, double pixelW, double pixelH)
     {
         const double sc = std::min(pixelW / kW, pixelH / kH);
+        // the wood, faceplates and printing never change: paint them once
+        // into an off-screen picture and reuse it on every frame
+        const int bw = (int)std::ceil(pixelW), bh = (int)std::ceil(pixelH);
+        if (!bg || bw != bgW || bh != bgH || natural() != bgNatural) {
+            if (bg) cairo_surface_destroy(bg);
+            bg = cairo_surface_create_similar(cairo_get_target(cr), CAIRO_CONTENT_COLOR, bw, bh);
+            bgW = bw; bgH = bh; bgNatural = natural(); ctlValid = false;
+            cairo_t* b = cairo_create(bg);
+            cairo_set_source_rgb(b, 0.05, 0.04, 0.035); cairo_paint(b);
+            cairo_scale(b, sc, sc);
+            cairo_select_font_face(b, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            drawCheek(b, 0, false);
+            drawCheek(b, kW - kCheek, true);
+            cairo_translate(b, kCheek, 0);
+            drawFaceplate(b);
+            drawModules(b);
+            cairo_destroy(b);
+        }
+        // the header, key buttons and knobs change only when a control moves or
+        // the sung note changes: keep them in a second picture on top of the first
+        CtlKey key;
+        std::memset(&key, 0, sizeof key);
+        for (int i = 0; i <= pLearn; ++i) key.v[i] = values[i];
+        key.hoverKnob = hoverKnob; key.dragKnob = dragKnob; key.hoverCell = hoverCell;
+        key.sung = currentTarget() >= 0 ? currentTarget() % 12 : -1;
+        key.leds = (voicedNow() ? 1 : 0) | ((voicedNow() && values[pOutVib] > 0.f) ? 2 : 0);
+        key.pulse = learning() ? nowT : 0.0;
+        if (!ctl || ctlW != bw || ctlH != bh || !ctlValid || std::memcmp(&key, &ctlKey, sizeof key) != 0) {
+            if (ctl && (ctlW != bw || ctlH != bh)) { cairo_surface_destroy(ctl); ctl = nullptr; }
+            if (!ctl) ctl = cairo_surface_create_similar(cairo_get_target(cr), CAIRO_CONTENT_COLOR, bw, bh);
+            ctlW = bw; ctlH = bh; ctlKey = key; ctlValid = true;
+            cairo_t* b = cairo_create(ctl);
+            cairo_set_source_surface(b, bg, 0, 0); cairo_paint(b);
+            cairo_scale(b, sc, sc);
+            cairo_select_font_face(b, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_translate(b, kCheek, 0);
+            drawHeader(b);
+            drawKeyStrip(b);
+            for (int k = 0; k < kNumKnobs; ++k) drawKnob(b, k);
+            cairo_destroy(b);
+        }
         cairo_save(cr);
-        cairo_set_source_rgb(cr, 0.05, 0.04, 0.035); cairo_paint(cr);
+        cairo_set_source_surface(cr, ctl, 0, 0); cairo_paint(cr);
         cairo_scale(cr, sc, sc);
         cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-
-        drawCheek(cr, 0, false);
-        drawCheek(cr, kW - kCheek, true);
         cairo_translate(cr, kCheek, 0);
 
-        drawFaceplate(cr);
-        drawHeader(cr);
-        drawKeyStrip(cr);
-        drawGraph(cr);
-        drawReadout(cr);
-        drawModules(cr);
-        for (int k = 0; k < kNumKnobs; ++k) drawKnob(cr, k);
+        const bool phrases = phraseMode && !learning();
+        if (phrases) drawPhraseGraph(cr); else drawGraph(cr);
+        drawTabs(cr);
+        if (phrases) drawPhrasePanel(cr); else drawReadout(cr);
         if (menuOpen) drawMenu(cr);
         cairo_restore(cr);
     }
@@ -104,7 +176,10 @@ public:
             menuOpen = false;
             return true;
         }
+        dirty = true;
         if (inRect(x, y, kScaleBox)) { menuOpen = true; return true; }
+        if (inRect(x, y, kLiveTab)) { phraseMode = false; return true; }
+        if (inRect(x, y, kPhraseTab)) { phraseMode = true; return true; }
         if (inRect(x, y, kClassicBtn)) { commit(pMode, 0.f); return true; }
         if (inRect(x, y, kNaturalBtn)) { commit(pMode, 1.f); return true; }
         if (inRect(x, y, kDetectBtn)) { commit(pLearn, learning() ? 0.f : 1.f); return true; }
@@ -112,6 +187,9 @@ public:
             if (inRect(x, y, applyRect()) && values[pOutKey] >= 0) { applyDetectedKey(); return true; }
             if (inRect(x, y, cancelRect())) { commit(pLearn, 0.f); return true; }
             if (inRect(x, y, kReadout)) return true;
+        } else if (phraseMode) {
+            if (inRect(x, y, kReadout)) { panelDown(x, y); return true; }
+            if (inRect(x, y, kGraph)) { graphDown(x, y); return true; }
         }
         const int cell = keyCellAt(x, y);
         if (cell >= 0) { commit(pKey, (float)cell); return true; }
@@ -133,6 +211,7 @@ public:
 
     bool mouseUp(double, double)
     {
+        if (gdrag != dNone) { graphUp(); return true; }
         if (dragKnob >= 0) { host->endEdit(kKnobParams[dragKnob]); dragKnob = -1; return true; }
         return false;
     }
@@ -143,6 +222,8 @@ public:
         hoverKnob = knobAt(x, y);
         hoverCell = keyCellAt(x, y);
         hoverMenu = menuOpen ? menuItemAt(x, y) : -1;
+        dirty = true;
+        if (gdrag != dNone) { graphDrag(x); return true; }
         if (dragKnob < 0) return false;
         if (fine != dragFine) { dragNorm = toNorm(kKnobParams[dragKnob], values[kKnobParams[dragKnob]]); dragY = y; dragFine = fine; }
         const int p = kKnobParams[dragKnob];
@@ -156,6 +237,17 @@ public:
     bool scroll(double x, double y, double dy)
     {
         x -= kCheek;
+        dirty = true;
+        if (phraseMode && !learning() && inRect(x, y, kGraph)) {
+            const int hit = regs.find(timeAt(x));
+            if (hit >= 0) {
+                sel = hit;
+                setPull(std::round(regs.r[hit].pull * 20.f + (dy > 0 ? 1 : -1)) / 20.f);
+            } else {
+                viewStart = std::max(0.0, viewStart + (dy > 0 ? -1.0 : 1.0));
+            }
+            return true;
+        }
         if (inRect(x, y, kScaleBox)) {
             int s = (int)values[pScale] + (dy > 0 ? -1 : 1);
             commit(pScale, (float)((s + kScaleCount) % kScaleCount));
@@ -198,6 +290,27 @@ private:
     double dragY = 0, dragNorm = 0, lastClickTime = -10;
     bool dragFine = false, menuOpen = false;
 
+    // phrase pull state
+    enum GDrag { dNone, dCreate, dResizeL, dResizeR, dPan, dSlider };
+    const TuneEngine* eng = nullptr;
+    RegionSet regs;
+    int sel = -1;
+    bool phraseMode = false, confirmClear = false, dirty = true;
+    GDrag gdrag = dNone;
+    double viewStart = 0.0, lastPos = -1.0, dragT0 = 0.0, dragT1 = 0.0, confirmT = 0.0, lastVoicedT = -100.0;
+    float pcenter = 60.f;
+    uint32_t seenScan = 0;
+    // cached static artwork
+    cairo_surface_t* bg = nullptr;
+    int bgW = 0, bgH = 0;
+    bool bgNatural = true;
+    struct CtlKey { float v[pLearn + 1]; int hoverKnob, dragKnob, hoverCell, sung, leds; double pulse; };
+    cairo_surface_t* ctl = nullptr;
+    CtlKey ctlKey;
+    int ctlW = 0, ctlH = 0;
+    bool ctlValid = false, pending = true;
+    double lastFrameT = -1.0;
+
     // ---------------- layout (faceplate coords, 860 x 540) ----------------
     struct Rect { double x, y, w, h; };
     static constexpr Rect kScaleBox   = { 254, 14, 220, 34 };
@@ -207,6 +320,16 @@ private:
     static constexpr Rect kKeyStrip   = { 92, 68, 744, 44 };
     static constexpr Rect kGraph      = { 24, 124, 588, 240 };
     static constexpr Rect kReadout    = { 624, 124, 212, 240 };
+    static constexpr Rect kLiveTab    = { 76, 131, 46, 18 };
+    static constexpr Rect kPhraseTab  = { 126, 131, 98, 18 };
+    static constexpr Rect kOverview   = { 32, 344, 572, 12 };
+    static constexpr double kPlotH = 214;      // phrase view: graph height above the overview strip
+    static constexpr double kViewLen = 12.0;   // seconds shown in the phrase view
+    static constexpr Rect kPullSlider = { 640, 226, 180, 16 };
+    static constexpr Rect kNoteDown   = { 694, 272, 34, 24 };
+    static constexpr Rect kNoteUp     = { 788, 272, 34, 24 };
+    static constexpr Rect kDeleteBtn  = { 638, 322, 96, 28 };
+    static constexpr Rect kClearBtn   = { 638, 322, 120, 28 };
     static constexpr double kModTop = 380, kSeamX = 470;
     static constexpr int  kNumKnobs   = 10;
     static constexpr int  kKnobParams[kNumKnobs] = { pRetune, pVibrato, pFlex, pHumanize, pTransition,
@@ -473,6 +596,344 @@ private:
 
     bool voicedNow() const { return histCount > 0 && at(0).voiced; }
     int currentTarget() const { return voicedNow() ? at(0).target : -1; }
+
+
+    // ---------------- phrase pull ----------------
+    double timeAt(double x) const { return viewStart + (x - kGraph.x) * kViewLen / kGraph.w; }
+    double xAt(double sec) const { return kGraph.x + (sec - viewStart) * kGraph.w / kViewLen; }
+    double scanSecs() const { return eng ? eng->scan.len.load(std::memory_order_relaxed) * PitchScan::kHop : 0.0; }
+    double songSecs() const
+    {
+        double L = std::max(20.0, scanSecs());
+        for (int i = 0; i < regs.n; ++i) L = std::max(L, regs.r[i].end);
+        if (eng && eng->meterPos > 0) L = std::max(L, (double)eng->meterPos);
+        return L;
+    }
+    void notify() { host->regionsChanged(regs); dirty = true; }
+
+    void setPull(float v)
+    {
+        if (sel < 0) return;
+        v = std::clamp(v, 0.f, 1.f);
+        if (std::lround(v * 100.f) == std::lround(regs.r[sel].pull * 100.f)) return;
+        regs.r[sel].pull = v;
+        notify();
+    }
+
+    void sliderTo(double x)
+    {
+        setPull((float)(std::round(std::clamp((x - kPullSlider.x) / kPullSlider.w, 0.0, 1.0) * 100.0) / 100.0));
+    }
+
+    void panTo(double x)
+    {
+        const double frac = std::clamp((x - kOverview.x) / kOverview.w, 0.0, 1.0);
+        viewStart = std::max(0.0, frac * songSecs() - 0.5 * kViewLen);
+    }
+
+    // free space around a time: the nearest phrase edges on either side
+    void gap(double t, int skip, double& lo, double& hi) const
+    {
+        lo = 0.0; hi = 1e9;
+        for (int i = 0; i < regs.n; ++i) {
+            if (i == skip) continue;
+            if (regs.r[i].end <= t + 1e-9) lo = std::max(lo, regs.r[i].end);
+            if (regs.r[i].start >= t - 1e-9) hi = std::min(hi, regs.r[i].start);
+        }
+    }
+
+    void graphDown(double x, double y)
+    {
+        if (y >= kOverview.y - 4) { gdrag = dPan; panTo(x); return; }
+        // grab the edge of a phrase to resize it
+        for (int i = 0; i < regs.n; ++i) {
+            if (std::fabs(x - xAt(regs.r[i].start)) < 5) { sel = i; gdrag = dResizeL; return; }
+            if (std::fabs(x - xAt(regs.r[i].end)) < 5)   { sel = i; gdrag = dResizeR; return; }
+        }
+        const double t = std::max(0.0, timeAt(x));
+        const int hit = regs.find(t);
+        if (hit >= 0) { sel = hit; return; }
+        sel = -1; gdrag = dCreate; dragT0 = dragT1 = t;
+    }
+
+    void graphDrag(double x)
+    {
+        if (gdrag == dPan) { panTo(x); return; }
+        if (gdrag == dSlider) { sliderTo(x); return; }
+        const double t = std::max(0.0, timeAt(std::clamp(x, kGraph.x, kGraph.x + kGraph.w)));
+        double lo, hi;
+        if (gdrag == dCreate) {
+            gap(dragT0, -1, lo, hi);
+            dragT1 = std::clamp(t, lo, hi);
+        } else if (sel >= 0) {
+            PullRegion& r = regs.r[sel];
+            gap(0.5 * (r.start + r.end), sel, lo, hi);
+            if (gdrag == dResizeL) r.start = std::clamp(t, lo, r.end - 0.1);
+            else r.end = std::clamp(t, r.start + 0.1, hi);
+        }
+    }
+
+    void graphUp()
+    {
+        const GDrag g = gdrag;
+        gdrag = dNone;
+        if (g == dCreate) {
+            const double a = std::min(dragT0, dragT1), b = std::max(dragT0, dragT1);
+            if (b - a >= 0.15 && regs.n < RegionSet::kMax) {
+                PullRegion r; r.start = a; r.end = b; r.pull = 1.f; r.shift = 0;
+                regs.r[regs.n++] = r;
+                regs.sort();
+                sel = regs.find(0.5 * (a + b));
+                notify();
+            }
+        } else if (g == dResizeL || g == dResizeR) {
+            notify();
+        }
+        dirty = true;
+    }
+
+    void panelDown(double x, double y)
+    {
+        if (sel >= 0) {
+            PullRegion& r = regs.r[sel];
+            if (x >= kPullSlider.x - 8 && x < kPullSlider.x + kPullSlider.w + 8 && y >= kPullSlider.y - 8 && y < kPullSlider.y + kPullSlider.h + 8) {
+                gdrag = dSlider; sliderTo(x);
+            } else if (inRect(x, y, kNoteDown)) { r.shift = std::max(-4, r.shift - 1); notify(); }
+            else if (inRect(x, y, kNoteUp))     { r.shift = std::min(4, r.shift + 1); notify(); }
+            else if (inRect(x, y, kDeleteBtn)) {
+                for (int i = sel; i + 1 < regs.n; ++i) regs.r[i] = regs.r[i + 1];
+                --regs.n; sel = -1; notify();
+            }
+        } else if (regs.n > 0 && inRect(x, y, kClearBtn)) {
+            if (confirmClear) { regs.n = 0; confirmClear = false; notify(); }
+            else { confirmClear = true; confirmT = nowT; }
+        }
+    }
+
+    static void fmtTime(double sec, char* buf, size_t n)
+    {
+        const int m = (int)(sec / 60.0);
+        std::snprintf(buf, n, "%d:%04.1f", m, sec - 60.0 * m);
+    }
+
+    static C pullColour(float pull) { return mix(kAmber, kCapPink, std::clamp(pull, 0.f, 1.f)); }
+
+    void drawTabs(cairo_t* cr)
+    {
+        const bool ph = phraseMode && !learning();
+        const Rect tabs[2] = { kLiveTab, kPhraseTab };
+        const char* names[2] = { "LIVE", "PHRASE PULL" };
+        for (int i = 0; i < 2; ++i) {
+            const Rect b = tabs[i];
+            const bool on = (i == 1) == ph;
+            if (on) rgb(cr, kAmber, 0.92); else cairo_set_source_rgba(cr, 1, 1, 1, 0.10);
+            rrect(cr, b.x, b.y, b.w, b.h, 4); cairo_fill(cr);
+            if (on) cairo_set_source_rgb(cr, 0.08, 0.07, 0.05); else rgb(cr, kPrint, 0.9);
+            text(cr, names[i], b.x + b.w / 2, b.y + 12.5, 9, 0);
+        }
+    }
+
+    void drawPhraseGraph(cairo_t* cr)
+    {
+        const Rect g = kGraph;
+        const double top = g.y, bot = g.y + kPlotH;
+        window(cr, g, 8);
+        cairo_save(cr);
+        rrect(cr, g.x, g.y, g.w, g.h, 8); cairo_clip(cr);
+
+        const PitchScan* sc = eng ? &eng->scan : nullptr;
+        const int n = sc ? sc->len.load(std::memory_order_relaxed) : 0;
+        const int i0 = std::max(0, (int)std::floor(viewStart / PitchScan::kHop));
+        const int i1 = std::min(n, (int)std::ceil((viewStart + kViewLen) / PitchScan::kHop) + 1);
+
+        // centre the view on what is sung in this stretch
+        {
+            double sum = 0; int cnt = 0;
+            for (int i = i0; i < i1; ++i) if (sc->in[i]) { sum += PitchScan::unpack(sc->in[i]); ++cnt; }
+            if (cnt > 8) {
+                const float want = (float)(sum / cnt);
+                if (std::fabs(want - pcenter) > 2.5f) pcenter = want;
+            }
+        }
+        const double lane = g.h / kSpan;
+        auto Y = [&](double midi) { return top + kPlotH / 2 - (midi - pcenter) * lane; };
+
+        // note lanes
+        char buf[48];
+        const int lo = (int)std::floor(pcenter - kSpan / 2) - 1, hi = (int)std::ceil(pcenter + kSpan / 2) + 1;
+        for (int m = lo; m <= hi; ++m) {
+            const double yc = Y(m);
+            if (inScale(m)) {
+                cairo_set_source_rgba(cr, 0.30, 0.50, 0.75, 0.10);
+                cairo_rectangle(cr, g.x, yc - lane / 2 + 0.5, g.w, lane - 1); cairo_fill(cr);
+                if (yc > top + 30 && yc < bot - 4) {
+                    const bool tonic = ((m % 12) + 12) % 12 == (int)values[pKey];
+                    rgb(cr, tonic ? kAmber : kDim, tonic ? 0.95 : 0.75);
+                    noteName(m, buf, sizeof buf);
+                    text(cr, buf, g.x + 10, yc + 4, 10, -1);
+                }
+            }
+            cairo_set_source_rgba(cr, 0.4, 0.55, 0.75, 0.10); cairo_set_line_width(cr, 1);
+            cairo_move_to(cr, g.x, std::round(yc - lane / 2) + 0.5); cairo_line_to(cr, g.x + g.w, std::round(yc - lane / 2) + 0.5); cairo_stroke(cr);
+        }
+        // seconds grid
+        for (int s = (int)std::ceil(viewStart); s < viewStart + kViewLen; ++s) {
+            const double x = std::round(xAt(s)) + 0.5;
+            cairo_set_source_rgba(cr, 0.4, 0.55, 0.75, s % 5 == 0 ? 0.22 : 0.09);
+            cairo_move_to(cr, x, top); cairo_line_to(cr, x, bot); cairo_stroke(cr);
+            if (s % 5 == 0) { fmtTime(s, buf, sizeof buf); buf[std::strlen(buf) - 2] = 0; rgb(cr, kDim, 0.8); text(cr, buf, x + 3, bot - 5, 8, -1); }
+        }
+
+        // phrases
+        auto band = [&](double a, double b, float pull, int shift, bool selected, bool ghost) {
+            const double xa = xAt(a), xb = xAt(b);
+            if (xb < g.x || xa > g.x + g.w) return;
+            const C c = pullColour(pull);
+            rgb(cr, c, ghost ? 0.14 : 0.10 + 0.16 * pull + (selected ? 0.08 : 0.0));
+            cairo_rectangle(cr, xa, top, xb - xa, kPlotH); cairo_fill(cr);
+            rgb(cr, c, 0.95); cairo_rectangle(cr, xa, top, xb - xa, 3); cairo_fill(cr);
+            cairo_set_line_width(cr, selected ? 1.6 : 1.0);
+            if (selected) cairo_set_source_rgba(cr, 1, 1, 1, 0.9); else rgb(cr, c, 0.7);
+            cairo_move_to(cr, std::round(xa) + .5, top); cairo_line_to(cr, std::round(xa) + .5, bot);
+            cairo_move_to(cr, std::round(xb) - .5, top); cairo_line_to(cr, std::round(xb) - .5, bot); cairo_stroke(cr);
+            if (selected) {     // grips
+                cairo_set_source_rgba(cr, 1, 1, 1, 0.9);
+                rrect(cr, xa - 2.5, top + kPlotH / 2 - 12, 5, 24, 2); cairo_fill(cr);
+                rrect(cr, xb - 2.5, top + kPlotH / 2 - 12, 5, 24, 2); cairo_fill(cr);
+            }
+            if (!ghost && xb - xa > 30) {
+                if (shift) std::snprintf(buf, sizeof buf, "%.0f%%  %+d", pull * 100.f, shift);
+                else std::snprintf(buf, sizeof buf, "%.0f%%", pull * 100.f);
+                rgb(cr, kText, 0.95); text(cr, buf, std::max(xa, g.x) + 5, top + 40, 10, -1);
+            }
+        };
+        for (int i = 0; i < regs.n; ++i) band(regs.r[i].start, regs.r[i].end, regs.r[i].pull, regs.r[i].shift, i == sel, false);
+        if (gdrag == dCreate && std::fabs(dragT1 - dragT0) > 0.01)
+            band(std::min(dragT0, dragT1), std::max(dragT0, dragT1), 1.f, 0, false, true);
+
+        // the vocal: sung pitch (amber) and corrected pitch (teal)
+        cairo_save(cr);
+        cairo_rectangle(cr, g.x, top, g.w, kPlotH); cairo_clip(cr);
+        cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND); cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+        for (int pass = 0; pass < 2 && sc; ++pass) {
+            const std::vector<uint16_t>& v = pass == 0 ? sc->in : sc->out;
+            cairo_set_line_width(cr, pass == 0 ? 1.6 : 2.2);
+            rgb(cr, pass == 0 ? kAmber : kAccent, pass == 0 ? 0.85 : 1.0);
+            bool pen = false; float last = 0;
+            for (int i = i0; i < i1; ++i) {
+                if (!v[i]) { pen = false; continue; }
+                const float mv = PitchScan::unpack(v[i]);
+                const double x = xAt(i * PitchScan::kHop), y = Y(mv);
+                if (pen && std::fabs(mv - last) > 3.f) pen = false;
+                if (!pen) { cairo_move_to(cr, x, y); cairo_line_to(cr, x + 0.01, y); pen = true; } else cairo_line_to(cr, x, y);
+                last = mv;
+            }
+            cairo_stroke(cr);
+        }
+        cairo_restore(cr);
+
+        // song position
+        const double pos = eng ? (double)eng->meterPos : -1.0;
+        if (pos >= viewStart && pos <= viewStart + kViewLen) {
+            const double x = std::round(xAt(pos)) + 0.5;
+            cairo_set_source_rgba(cr, 1, 1, 1, 0.85); cairo_set_line_width(cr, 1.2);
+            cairo_move_to(cr, x, top); cairo_line_to(cr, x, bot); cairo_stroke(cr);
+        }
+
+        // overview of the whole song
+        {
+            const Rect o = kOverview;
+            const double L = songSecs();
+            cairo_set_source_rgba(cr, 1, 1, 1, 0.07); rrect(cr, o.x, o.y, o.w, o.h, 3); cairo_fill(cr);
+            if (sc && n > 0) {      // where there is singing
+                rgb(cr, kAmber, 0.55);
+                const int cols = (int)o.w;
+                for (int cx = 0; cx < cols; ++cx) {
+                    const int a = (int)(cx * L / cols / PitchScan::kHop), b = (int)((cx + 1) * L / cols / PitchScan::kHop);
+                    bool any = false;
+                    for (int i = a; i < b && i < n; i += 4) if (sc->in[i]) { any = true; break; }
+                    if (any) cairo_rectangle(cr, o.x + cx, o.y + 4, 1, o.h - 8);
+                }
+                cairo_fill(cr);
+            }
+            for (int i = 0; i < regs.n; ++i) {
+                rgb(cr, pullColour(regs.r[i].pull), 0.9);
+                cairo_rectangle(cr, o.x + regs.r[i].start / L * o.w, o.y + 1, std::max(2.0, (regs.r[i].end - regs.r[i].start) / L * o.w), o.h - 2);
+                cairo_fill(cr);
+            }
+            cairo_set_source_rgba(cr, 1, 1, 1, 0.75); cairo_set_line_width(cr, 1);
+            rrect(cr, o.x + std::min(viewStart / L, 1.0) * o.w + .5, o.y - 1.5, std::max(4.0, std::min(kViewLen / L, 1.0) * o.w), o.h + 3, 2); cairo_stroke(cr);
+            if (pos >= 0 && pos <= L) { cairo_set_source_rgba(cr, 1, 1, 1, 0.9); cairo_rectangle(cr, o.x + pos / L * o.w - .5, o.y - 2, 1.5, o.h + 4); cairo_fill(cr); }
+        }
+        cairo_restore(cr);
+
+        // legend
+        cairo_set_line_width(cr, 3);
+        rgb(cr, kAmber); cairo_move_to(cr, g.x + g.w - 196, g.y + 16); cairo_line_to(cr, g.x + g.w - 180, g.y + 16); cairo_stroke(cr);
+        rgb(cr, kDim); text(cr, "SUNG", g.x + g.w - 175, g.y + 20, 9, -1);
+        rgb(cr, kAccent); cairo_move_to(cr, g.x + g.w - 116, g.y + 16); cairo_line_to(cr, g.x + g.w - 100, g.y + 16); cairo_stroke(cr);
+        rgb(cr, kDim); text(cr, "CORRECTED", g.x + g.w - 95, g.y + 20, 9, -1);
+
+        if (!eng || eng->meterPos < 0) {
+            rgb(cr, kDim, 0.9); text(cr, "Phrase Pull needs the song position from the host", g.x + g.w / 2, top + kPlotH / 2, 12, 0);
+            text(cr, "(use the LV2, VST3 or VST2 version)", g.x + g.w / 2, top + kPlotH / 2 + 18, 10, 0);
+        } else if (n == 0) {
+            rgb(cr, kText, 0.85); text(cr, "Play the song once", g.x + g.w / 2, top + kPlotH / 2 - 4, 15, 0);
+            rgb(cr, kDim, 0.9); text(cr, "The vocal's pitch is drawn here as it plays. Then drag across a phrase.", g.x + g.w / 2, top + kPlotH / 2 + 16, 10, 0);
+        }
+    }
+
+    void drawPhrasePanel(cairo_t* cr)
+    {
+        const Rect r = kReadout;
+        window(cr, r, 8);
+        char buf[64], a[16], b[16];
+        rgb(cr, kDim); text(cr, "PHRASE PULL", r.x + 14, r.y + 22, 9, -1);
+        std::snprintf(buf, sizeof buf, "%d phrase%s", regs.n, regs.n == 1 ? "" : "s");
+        text(cr, buf, r.x + r.w - 14, r.y + 22, 9, 1);
+
+        if (sel < 0) {
+            rgb(cr, kText, 0.9);
+            text(cr, "Drag across a phrase", r.x + r.w / 2, r.y + 66, 13, 0);
+            text(cr, "to pull it into key.", r.x + r.w / 2, r.y + 84, 13, 0);
+            rgb(cr, kDim);
+            text(cr, "Click a phrase to adjust it.", r.x + 14, r.y + 118, 10, -1);
+            text(cr, "Drag its edges to resize.", r.x + 14, r.y + 134, 10, -1);
+            text(cr, "Scroll on it: pull harder / softer.", r.x + 14, r.y + 150, 10, -1);
+            text(cr, "Scroll elsewhere, or drag the", r.x + 14, r.y + 166, 10, -1);
+            text(cr, "bottom strip, to move along.", r.x + 14, r.y + 182, 10, -1);
+            if (regs.n > 0) pushButton(cr, kClearBtn, confirmClear ? "SURE?" : "CLEAR ALL", confirmClear, kRed, 10.5, 11);
+            return;
+        }
+        const PullRegion& p = regs.r[sel];
+        fmtTime(p.start, a, sizeof a); fmtTime(p.end, b, sizeof b);
+        std::snprintf(buf, sizeof buf, "%s \xe2\x80\x93 %s", a, b);
+        rgb(cr, kText, 0.9); text(cr, buf, r.x + r.w / 2, r.y + 44, 11, 0);
+
+        const C c = pullColour(p.pull);
+        std::snprintf(buf, sizeof buf, "%.0f%%", p.pull * 100.f);
+        rgb(cr, c, 0.18); text(cr, buf, r.x + r.w / 2 + 1, r.y + 87, 38, 0);
+        rgb(cr, c); text(cr, buf, r.x + r.w / 2, r.y + 86, 38, 0);
+
+        // pull slider
+        const Rect s = kPullSlider;
+        cairo_set_source_rgb(cr, 0.02, 0.03, 0.05); rrect(cr, s.x - 2, s.y + 3, s.w + 4, s.h - 6, 5); cairo_fill(cr);
+        rgb(cr, c, 0.9); rrect(cr, s.x, s.y + 5, std::max(4.0, s.w * p.pull), s.h - 10, 3); cairo_fill(cr);
+        const double hx = s.x + s.w * p.pull;
+        cairo_set_source_rgba(cr, 0, 0, 0, 0.5); cairo_arc(cr, hx + 1, s.y + s.h / 2 + 1.5, 8, 0, 2 * M_PI); cairo_fill(cr);
+        cairo_set_source_rgb(cr, 0.93, 0.93, 0.92); cairo_arc(cr, hx, s.y + s.h / 2, 7.5, 0, 2 * M_PI); cairo_fill(cr);
+        rgb(cr, kDim); text(cr, "AS SET", s.x - 2, s.y + 32, 8, -1); text(cr, "SNAP", s.x + s.w + 2, s.y + 32, 8, 1);
+
+        // move the target note
+        rgb(cr, kDim); text(cr, "NOTE", r.x + 16, kNoteDown.y + 16, 9, -1);
+        pushButton(cr, kNoteDown, "\xe2\x96\xbc", false, kAmber, 10, 0.001);
+        pushButton(cr, kNoteUp, "\xe2\x96\xb2", false, kAmber, 10, 0.001);
+        if (p.shift == 0) std::snprintf(buf, sizeof buf, "nearest");
+        else std::snprintf(buf, sizeof buf, "%d %s", std::abs(p.shift), p.shift > 0 ? "up" : "down");
+        rgb(cr, p.shift ? kAmber : kText); text(cr, buf, (kNoteDown.x + kNoteDown.w + kNoteUp.x) / 2, kNoteDown.y + 16, 11, 0);
+
+        pushButton(cr, kDeleteBtn, "DELETE", true, kRed, 10.5, 11);
+    }
 
     // ---------------- faceplate ----------------
     void drawFaceplate(cairo_t* cr)

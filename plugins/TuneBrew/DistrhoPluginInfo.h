@@ -18,6 +18,11 @@
 #define DISTRHO_PLUGIN_NUM_INPUTS    2
 #define DISTRHO_PLUGIN_NUM_OUTPUTS   2
 #define DISTRHO_PLUGIN_WANT_LATENCY  1
+#define DISTRHO_PLUGIN_WANT_TIMEPOS  1
+#define DISTRHO_PLUGIN_WANT_STATE    1
+#define DISTRHO_PLUGIN_WANT_FULL_STATE 1
+// the editor reads the pitch scan straight from the plugin (same process)
+#define DISTRHO_PLUGIN_WANT_DIRECT_ACCESS 1
 
 #define DISTRHO_PLUGIN_LV2_CATEGORY    "lv2:PitchPlugin"
 #define DISTRHO_PLUGIN_VST3_CATEGORIES "Fx|Pitch Shift|Stereo"

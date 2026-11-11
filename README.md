@@ -8,7 +8,7 @@
 
 [![TuneBrew Autotune](docs/screenshot.png)](plugins/TuneBrew/README.md)
 
-Real-time pitch correction that tunes hard and still sounds human. It keeps vibrato at 0 ms retune, detects the key for you, and has a classic hard-tune mode for the robot effect.
+Real-time pitch correction that tunes hard and still sounds human. It keeps vibrato at 0 ms retune, detects the key for you, and has a classic hard-tune mode for the robot effect. With Phrase Pull you mark the phrases that are still off on a picture of the take and pull just those harder into key.
 **[Read the TuneBrew guide →](plugins/TuneBrew/README.md)**
 
 ### [LevelBrew Vocal Rider](plugins/LevelBrew/README.md)
